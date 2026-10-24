@@ -1,4 +1,4 @@
-const CACHE = 'pixelvault-v3';
+const CACHE = 'pixelvault-v4';
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['/', '/index.html', '/manifest.webmanifest'])));
   self.skipWaiting();
