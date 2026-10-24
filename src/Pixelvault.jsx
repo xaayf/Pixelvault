@@ -1181,7 +1181,7 @@ function PixelVaultApplication() {
       <header className={`sticky top-0 z-40 h-16 px-4 lg:px-8 border-b transition-colors ${isDark ? 'bg-[#070A12]/85 border-white/10' : 'bg-white/85 border-slate-200'} backdrop-blur-xl flex items-center justify-between`}>
         {/* Left: Precision Prism SVG Logo + Badge */}
         <div className="flex items-center gap-3 min-w-0">
-          <img src="/logo-mark.png" alt="PixelVault" className="h-10 w-auto shrink-0 rounded-lg drop-shadow-[0_0_8px_rgba(34,211,238,0.35)]" draggable={false} />
+          <img src="/logo-mark.svg" alt="PixelVault" className="h-10 w-10 shrink-0" draggable={false} />
           <div className="truncate">
             <div className="flex items-center gap-2.5">
               <span className="font-bold text-base lg:text-lg tracking-tight bg-gradient-to-r from-cyan-400 via-sky-300 to-indigo-400 bg-clip-text text-transparent">
