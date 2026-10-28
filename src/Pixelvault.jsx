@@ -23,6 +23,15 @@ const NAMING_PATTERNS = [
   { id: 'exact_name', label: '[NamaAsli].jpg (Nama Bersih)', suffix: '.jpg', sanitizeSpaces: false }
 ];
 
+// File hasil PixelVault dikenali dari akhiran namanya; akhiran tidak boleh bertumpuk dan pengguna diperingatkan soal kompresi ganda.
+const PROCESSED_STEMS_RE = /_(?:300DPI_PrintMaster|DisplateMaster_300DPI|300DPI_Master|sRGB_PrintReady_300DPI)/gi;
+function isAlreadyProcessedName(name) {
+  return new RegExp(PROCESSED_STEMS_RE.source, 'i').test(String(name || ''));
+}
+function stripProcessedStems(base) {
+  return String(base).replace(PROCESSED_STEMS_RE, '').replace(/_{2,}/g, '_').replace(/^[_-]+|[_-]+$/g, '');
+}
+
 const CRISPING_MODES = [
   { id: 'off', label: 'Off (1:1 Native)', strength: 0, desc: 'Tanpa penajaman tambahan, murni piksel asli.' },
   { id: 'subtle', label: 'Subtle Print Crisp', strength: 0.22, desc: 'Kompensasi subsampling ringan untuk menjaga tekstur kanvas/kertas.' },
@@ -674,6 +683,7 @@ function PixelVaultApplication() {
         .replace(/[^a-zA-Z0-9-_]/g, '')
         .replace(/-+/g, '-');
     }
+    if (activeNamingPattern.suffix !== '.jpg') baseName = stripProcessedStems(baseName);
     return `${baseName || 'Master-Artwork'}${activeNamingPattern.suffix}`;
   }, [activeNamingPattern, sanitizeCommercialName]);
 
@@ -726,12 +736,17 @@ function PixelVaultApplication() {
       ratioDecimal: ratioInfo.decimal,
       originalDpi: originalDpi ? `${originalDpi.xDpi} DPI` : '72/96 DPI (Default)',
       hasAlphaRisk,
+      alreadyProcessed: isAlreadyProcessedName(file.name),
       previewUrl
     });
 
     setEnableEdgeFitCrop(false); // Reset to 100% strict dimension lock on new file
     setProgressInfo({ step: 0, total: 8, quality: 0, message: 'Siap dioptimalkan (dimensi piksel tidak diubah).', logs: [] });
-    triggerToast(`Berhasil memuat "${file.name}" (${img.naturalWidth} × ${img.naturalHeight} px)`, 'success');
+    if (isAlreadyProcessedName(file.name)) {
+      triggerToast('File ini sudah pernah diproses PixelVault. Memproses ulang menambah satu generasi kompresi JPEG; pakai file master asli bila ada.', 'info');
+    } else {
+      triggerToast(`Berhasil memuat "${file.name}" (${img.naturalWidth} × ${img.naturalHeight} px)`, 'success');
+    }
   }, [sourceItem, optimizedResult, createSafeObjectUrl, revokeSafeObjectUrl, triggerToast]);
 
   const handleRunOptimization = useCallback(async () => {
@@ -2012,7 +2027,7 @@ function PixelVaultApplication() {
                   <div>
                     <h3 className="text-sm font-bold flex items-center gap-2 text-cyan-400">
                       <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                      Displate & Marketplace Pre-Flight Compliance Gate (6-Point Audit)
+                      Displate & Marketplace Pre-Flight Compliance Gate ({preFlightGates ? preFlightGates.totalCount : 6}-Point Audit)
                     </h3>
                     <p className="text-[11px] text-slate-400">
                       Verifikasi otomatis syarat teknis cetak sebelum di-upload ke portal Displate / Marketplace.
@@ -2030,6 +2045,13 @@ function PixelVaultApplication() {
                     </span>
                   )}
                 </div>
+
+                {sourceItem?.alreadyProcessed && (
+                  <div className="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-[11px] text-amber-200 flex items-start gap-2" data-testid="already-processed-note">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>File ini sudah pernah diproses PixelVault (dari nama file). Memproses lagi hanya meng-encode JPEG sekali lagi, jadi kualitas turun sedikit dan tidak ada gunanya untuk dimensi sama. Pakai file master asli bila ada. Nama hasil tidak akan menumpuk akhiran.</span>
+                  </div>
+                )}
 
                 {preFlightGates ? (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
