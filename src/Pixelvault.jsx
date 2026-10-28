@@ -9,6 +9,7 @@ import {
 
 const PRESETS = [
   { id: 'displate', name: 'Displate Metal Print Master', maxMB: 28.5, hardLimitMB: 30.0, dpi: 300, ratioTarget: 1.4, minShortSide: 2900, minLongSide: 4060, badge: 'Displate < 28.5 MB', desc: 'Batas keras Displate 30 MB (Buffer aman 1.5 MB). Rasio ideal 1.4:1, sisi pendek ≥ 2900px, panjang ≥ 4060px, sRGB 300 DPI.' },
+  { id: 'adobe', name: 'Adobe Stock (JPEG, 4–100 MP)', maxMB: 43.0, hardLimitMB: 45.0, dpi: 300, ratioTarget: null, minShortSide: 0, minLongSide: 0, mpMode: true, minMP: 4, maxMP: 100, upscaleCapMP: 8, embedSrgb: true, badge: 'Adobe < 43 MB', desc: 'JPEG sRGB, 4–100 MP, maks 45 MB (buffer 2 MB). Tanpa crop rasio. Upscale hanya jika di bawah 4 MP dan dibatasi 8 MP; kualitas JPEG dijaga tinggi karena Adobe menolak gambar "too compressed".' },
   { id: 'etsy', name: 'Etsy Digital Printable', maxMB: 19.5, hardLimitMB: 20.0, dpi: 300, ratioTarget: null, minShortSide: 2400, minLongSide: 3000, badge: 'Etsy < 19.5 MB', desc: 'Optimasi unduhan instan Etsy (Batas platform 20 MB). Mempertahankan ketajaman cetak 300 DPI penuh.' },
   { id: 'faa', name: 'Fine Art America / Society6', maxMB: 24.0, hardLimitMB: 25.0, dpi: 300, ratioTarget: null, minShortSide: 2500, minLongSide: 3500, badge: 'FAA/S6 < 24.0 MB', desc: 'Standar galeri cetak kanvas & poster akrilik resolusi ultra-tinggi dengan injeksi 300 DPI.' },
   { id: 'custom', name: 'Custom Target Size (MB)', maxMB: 15.0, hardLimitMB: 15.0, dpi: 300, ratioTarget: null, minShortSide: 1000, minLongSide: 1000, badge: 'Custom Target', desc: 'Tentukan batas ukuran megabyte secara presisi sesuai kebutuhan klien atau portal cetak khusus.' }
@@ -31,6 +32,17 @@ const CRISPING_MODES = [
 // Upscale interpolasi (bukan AI): perbesar sampai memenuhi sisi minimum preset. Tidak menambah detail asli.
 function applyUpscale(geom, preset, enabled) {
   if (!enabled) return { ...geom, scale: 1 };
+  if (preset.mpMode) {
+    // Mode megapiksel (Adobe): naikkan hanya kalau < minMP, targetnya sedikit di atas minimum, dibatasi upscaleCapMP.
+    const px = geom.sw * geom.sh;
+    if (px >= preset.minMP * 1e6) return { ...geom, scale: 1 };
+    const target = Math.min(preset.minMP * 1.05, preset.upscaleCapMP) * 1e6;
+    const scale = Math.sqrt(target / px);
+    let outW = Math.ceil(geom.sw * scale);
+    let outH = Math.ceil(geom.sh * scale);
+    while (outW * outH < preset.minMP * 1e6) { outW += 1; outH = Math.ceil(outW * geom.sh / geom.sw); }
+    return { ...geom, outW, outH, scale: outW / geom.sw };
+  }
   const short = Math.min(geom.sw, geom.sh);
   const long = Math.max(geom.sw, geom.sh);
   let scale = Math.max(1, preset.minShortSide / short, preset.minLongSide / long);
@@ -308,6 +320,44 @@ async function injectJpeg300Dpi(jpegBlob, targetDpi = 300) {
   return { blob: new Blob([merged.buffer], { type: 'image/jpeg' }), dpiVerified: true };
 }
 
+const SRGB_ICC_B64 = 'AAACTGxjbXMEQAAAbW50clJHQiBYWVogB+oACgAcAAMADwAaYWNzcEFQUEwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y1sY21zAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALZGVzYwAAAQgAAAA2Y3BydAAAAUAAAABMd3RwdAAAAYwAAAAUY2hhZAAAAaAAAAAsclhZWgAAAcwAAAAUYlhZWgAAAeAAAAAUZ1hZWgAAAfQAAAAUclRSQwAAAggAAAAgZ1RSQwAAAggAAAAgYlRSQwAAAggAAAAgY2hybQAAAigAAAAkbWx1YwAAAAAAAAABAAAADGVuVVMAAAAaAAAAHABzAFIARwBCACAAYgB1AGkAbAB0AC0AaQBuAABtbHVjAAAAAAAAAAEAAAAMZW5VUwAAADAAAAAcAE4AbwAgAGMAbwBwAHkAcgBpAGcAaAB0ACwAIAB1AHMAZQAgAGYAcgBlAGUAbAB5WFlaIAAAAAAAAPbWAAEAAAAA0y1zZjMyAAAAAAABDEIAAAXe///zJQAAB5MAAP2Q///7of///aIAAAPcAADAblhZWiAAAAAAAABvoAAAOPUAAAOQWFlaIAAAAAAAACSfAAAPhAAAtsNYWVogAAAAAAAAYpcAALeHAAAY2XBhcmEAAAAAAAMAAAACZmYAAPKnAAANWQAAE9AAAApbY2hybQAAAAAAAwAAAACj1wAAVHsAAEzNAACZmgAAJmYAAA9c';
+
+/**
+ * Menyisipkan profil sRGB (APP2 'ICC_PROFILE') bila JPEG belum punya profil.
+ * Canvas.toBlob umumnya membuang profil warna; Adobe Stock meminta sRGB.
+ */
+async function injectSrgbIcc(jpegBlob) {
+  try {
+    const bytes = new Uint8Array(await jpegBlob.arrayBuffer());
+    if (bytes.length < 20 || bytes[0] !== 0xFF || bytes[1] !== 0xD8) return { blob: jpegBlob, iccEmbedded: false };
+    const view = new DataView(bytes.buffer);
+    const tag = [0x49,0x43,0x43,0x5F,0x50,0x52,0x4F,0x46,0x49,0x4C,0x45,0x00];
+    let off = 2, insertAt = 2;
+    while (off + 4 < bytes.length) {
+      const m = view.getUint16(off, false);
+      if ((m & 0xFF00) !== 0xFF00 || m === 0xFFDA) break;
+      const len = view.getUint16(off + 2, false);
+      if (m === 0xFFE2 && tag.every((b, i) => bytes[off + 4 + i] === b)) return { blob: jpegBlob, iccEmbedded: true };
+      if (m === 0xFFE0 || m === 0xFFE1) insertAt = off + 2 + len;
+      off += 2 + len;
+    }
+    const bin = atob(SRGB_ICC_B64);
+    const icc = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) icc[i] = bin.charCodeAt(i);
+    const segLen = 2 + 12 + 2 + icc.length;
+    const seg = new Uint8Array(2 + segLen);
+    seg[0] = 0xFF; seg[1] = 0xE2; seg[2] = (segLen >> 8) & 0xFF; seg[3] = segLen & 0xFF;
+    seg.set(tag, 4); seg[16] = 1; seg[17] = 1; seg.set(icc, 18);
+    const out = new Uint8Array(bytes.length + seg.length);
+    out.set(bytes.subarray(0, insertAt), 0);
+    out.set(seg, insertAt);
+    out.set(bytes.subarray(insertAt), insertAt + seg.length);
+    return { blob: new Blob([out.buffer], { type: 'image/jpeg' }), iccEmbedded: true };
+  } catch (e) {
+    return { blob: jpegBlob, iccEmbedded: false };
+  }
+}
+
 /**
  * Reads back the binary JFIF header from any JPEG Blob to verify actual stored DPI
  */
@@ -353,9 +403,15 @@ function canvasToJpegBlob(canvas, quality) {
   });
 }
 
-async function findOptimalQualityBlob(canvas, targetMaxMB, dpi, onStepProgress) {
+async function findOptimalQualityBlob(canvas, targetMaxMB, dpi, onStepProgress, opts = {}) {
   const targetBytes = Math.floor(targetMaxMB * 1024 * 1024);
   const logs = [];
+  const finalize = async (blob) => {
+    const r = await injectJpeg300Dpi(blob, dpi);
+    if (!opts.embedSrgb) return { ...r, iccEmbedded: false };
+    const s = await injectSrgbIcc(r.blob);
+    return { ...r, blob: s.blob, iccEmbedded: s.iccEmbedded };
+  };
 
   // Step 0: Fast path check at q = 0.99
   onStepProgress({ step: 1, total: 8, quality: 0.99, message: 'Menguji Kualitas Maksimum (q=0.990)...', logs });
@@ -363,13 +419,14 @@ async function findOptimalQualityBlob(canvas, targetMaxMB, dpi, onStepProgress) 
   logs.push({ iter: 0, q: 0.99, bytes: initialBlob.size, pass: initialBlob.size <= targetBytes });
 
   if (initialBlob.size <= targetBytes) {
-    const injected = await injectJpeg300Dpi(initialBlob, dpi);
+    const injected = await finalize(initialBlob);
     onStepProgress({ step: 8, total: 8, quality: 0.99, message: 'Kualitas q=0.990 sudah di bawah target!', logs });
     return {
       blob: injected.blob,
       quality: 0.99,
       iterations: 1,
       dpiVerified: injected.dpiVerified,
+      iccEmbedded: injected.iccEmbedded,
       logs,
       zeroLoss: true
     };
@@ -423,7 +480,7 @@ async function findOptimalQualityBlob(canvas, targetMaxMB, dpi, onStepProgress) 
     bestQuality = fallbackBlob.size < lowestAttemptBlob.size ? emergencyQ : lowestAttemptQuality;
   }
 
-  const injected = await injectJpeg300Dpi(bestBlob, dpi);
+  const injected = await finalize(bestBlob);
   onStepProgress({
     step: 8,
     total: 8,
@@ -437,6 +494,7 @@ async function findOptimalQualityBlob(canvas, targetMaxMB, dpi, onStepProgress) 
     quality: bestQuality,
     iterations: logs.length,
     dpiVerified: injected.dpiVerified,
+    iccEmbedded: injected.iccEmbedded,
     logs,
     zeroLoss: false
   };
@@ -528,7 +586,7 @@ function PixelVaultApplication() {
 
   // Phase 3: Micro-Contrast Texture Preservation & Banding Shield Controls
   const [crispMode, setCrispMode] = useState('subtle'); // 'off' | 'subtle' | 'metal'
-  const [enableBandingShield, setEnableBandingShield] = useState(true);
+  const [enableBandingShield, setEnableBandingShield] = useState(false);
   const [sanitizeCommercialName, setSanitizeCommercialName] = useState(true);
 
   // Active Primary File & Result State (Uses ObjectURLs exclusively for RAM safety)
@@ -729,7 +787,8 @@ function PixelVaultApplication() {
         canvas,
         activePreset.maxMB,
         activePreset.dpi,
-        (prog) => setProgressInfo(prog)
+        (prog) => setProgressInfo(prog),
+        { embedSrgb: Boolean(activePreset.embedSrgb) }
       );
       const durationMs = Math.round(performance.now() - startTime);
 
@@ -761,6 +820,9 @@ function PixelVaultApplication() {
         ratioText: outRatioInfo.text,
         ratioDecimal: outRatioInfo.decimal,
         edgeFitApplied: geom.cropped,
+        upscaleApplied: geom.scale > 1,
+        upscaleFactor: geom.scale,
+        iccEmbedded: Boolean(result.iccEmbedded),
         cropRect: geom,
         dimensionsIdentical: verifyImg.naturalWidth === sourceItem.width && verifyImg.naturalHeight === sourceItem.height,
         qualityFactor: (result.quality * 100).toFixed(1),
@@ -996,7 +1058,7 @@ function PixelVaultApplication() {
                 : q
             )
           );
-        });
+        }, { embedSrgb: Boolean(activePreset.embedSrgb) });
 
         // Release canvas RAM before next file in queue
         canvas.width = 0;
@@ -1079,12 +1141,15 @@ function PixelVaultApplication() {
 
     // 2. Dimension Lock Gate (Output === Input, 0 px lost, or intentional 1.4:1 Full-Bleed Crop)
     const isZeroPxLost = currentW === sourceItem.width && currentH === sourceItem.height;
-    const dimPass = isZeroPxLost || (optimizedResult?.edgeFitApplied === true);
+    const upscaled = optimizedResult?.upscaleApplied === true;
+    const dimPass = isZeroPxLost || (optimizedResult?.edgeFitApplied === true) || upscaled;
+    const mpMode = Boolean(activePreset.mpMode);
+    const curMP = (currentW * currentH) / 1e6;
 
     // 3. Min-Resolution Gate (Short side >= 2900 px AND Long side >= 4060 px for Displate)
     const minShortReq = activePreset.minShortSide || 2900;
     const minLongReq = activePreset.minLongSide || 4060;
-    const resPass = shortSide >= minShortReq && longSide >= minLongReq;
+    const resPass = mpMode ? (curMP >= activePreset.minMP && curMP <= activePreset.maxMP) : (shortSide >= minShortReq && longSide >= minLongReq);
 
     // 4. Aspect Ratio Gate (1.4:1 / 5:7 check)
     const targetRatio = activePreset.ratioTarget || 1.4;
@@ -1093,10 +1158,11 @@ function PixelVaultApplication() {
     const needsEdgeFitSuggestion = ratioDiff > 0.015;
 
     // 5. DPI Metadata Gate (300 DPI JFIF Binary Verified)
-    const dpiPass = optimizedResult ? Boolean(optimizedResult.dpiVerifiedNumeric) : sourceItem.originalDpi === '300 DPI';
+    const dpiPass = mpMode ? true : optimizedResult ? Boolean(optimizedResult.dpiVerifiedNumeric) : sourceItem.originalDpi === '300 DPI';
 
     // 6. Color Profile & Alpha Gate (Flattened sRGB JPEG without PNG transparency bloat)
-    const alphaPass = optimizedResult ? true : !sourceItem.hasAlphaRisk;
+    const iccNeeded = Boolean(activePreset.embedSrgb);
+    const alphaPass = optimizedResult ? (!iccNeeded || optimizedResult.iccEmbedded) : !sourceItem.hasAlphaRisk;
 
     const previewCropGeom = computeSourceDrawRect(sourceItem.width, sourceItem.height, true, 1.4);
 
@@ -1112,24 +1178,28 @@ function PixelVaultApplication() {
         id: 'dimlock',
         title: '2. Dimension Lock Gate',
         pass: dimPass,
-        badge: isZeroPxLost ? '0 PX LOST (100% LOCK)' : '1.4:1 EDGE-FIT ACTIVE',
+        badge: isZeroPxLost ? '0 PX LOST (100% LOCK)' : upscaled ? `UPSCALE ×${optimizedResult.upscaleFactor.toFixed(2)}` : '1.4:1 EDGE-FIT ACTIVE',
         detail: isZeroPxLost
           ? `Identik ${currentW} × ${currentH} px`
-          : `Cropped ${currentW} × ${currentH} px (Dari ${sourceItem.width}×${sourceItem.height})`
+          : upscaled
+            ? `Diperbesar ${currentW} × ${currentH} px (Dari ${sourceItem.width}×${sourceItem.height}). Interpolasi, tidak ada detail baru.`
+            : `Cropped ${currentW} × ${currentH} px (Dari ${sourceItem.width}×${sourceItem.height})`
       },
       {
         id: 'minres',
-        title: '3. Min-Resolution Gate',
+        title: mpMode ? '3. Resolusi Gate (MP)' : '3. Min-Resolution Gate',
         pass: resPass,
-        badge: resPass ? 'LOLOS STANDAR CETAK' : 'RESOLUSI KURANG',
-        detail: `Pendek: ${shortSide}px (≥${minShortReq}) • Panjang: ${longSide}px (≥${minLongReq})`
+        badge: resPass ? 'LOLOS STANDAR CETAK' : mpMode && curMP > activePreset.maxMP ? 'TERLALU BESAR' : 'RESOLUSI KURANG',
+        detail: mpMode ? `${curMP.toFixed(2)} MP (syarat ${activePreset.minMP}–${activePreset.maxMP} MP)` : `Pendek: ${shortSide}px (≥${minShortReq}) • Panjang: ${longSide}px (≥${minLongReq})`
       },
       {
         id: 'ratio',
-        title: '4. Aspect Ratio Gate (1.4:1)',
+        title: activePreset.ratioTarget ? '4. Aspect Ratio Gate (1.4:1)' : '4. Aspect Ratio (bebas)',
         pass: ratioPass,
-        badge: ratioPass ? `IDEAL ${currentRatio.toFixed(2)}:1` : `MELENCENG (${currentRatio.toFixed(2)}:1)`,
-        detail: ratioPass
+        badge: !activePreset.ratioTarget ? `${currentRatio.toFixed(2)}:1 (BEBAS)` : ratioPass ? `IDEAL ${currentRatio.toFixed(2)}:1` : `MELENCENG (${currentRatio.toFixed(2)}:1)`,
+        detail: !activePreset.ratioTarget
+          ? 'Preset ini tidak mewajibkan rasio tertentu'
+          : ratioPass
           ? 'Sesuai standar Displate 1.4:1 (5:7)'
           : `Selisih ${ratioDiff.toFixed(2)} dari 1.4:1. Tersedia opsi Smart Edge-Fit.`
       },
@@ -1137,22 +1207,40 @@ function PixelVaultApplication() {
         id: 'dpi',
         title: '5. DPI Metadata Gate',
         pass: dpiPass,
-        badge: dpiPass ? '300 DPI LOCKED' : 'BELUM 300 DPI',
-        detail: optimizedResult ? optimizedResult.dpiHeader : `Saat ini: ${sourceItem.originalDpi}`
+        badge: mpMode ? 'TIDAK DIWAJIBKAN' : dpiPass ? '300 DPI LOCKED' : 'BELUM 300 DPI',
+        detail: mpMode ? 'Adobe hanya meminta 300 ppi untuk hasil scan / gambar tangan' : optimizedResult ? optimizedResult.dpiHeader : `Saat ini: ${sourceItem.originalDpi}`
       },
       {
         id: 'color',
         title: '6. Color Profile & Alpha Gate',
         pass: alphaPass,
-        badge: alphaPass ? 'sRGB FLATTENED' : 'PNG ALPHA DETECTED',
+        badge: alphaPass ? (iccNeeded && optimizedResult ? 'sRGB + ICC TERTANAM' : 'sRGB FLATTENED') : optimizedResult ? 'PROFIL sRGB GAGAL' : 'PNG ALPHA DETECTED',
         detail: alphaPass
           ? `sRGB 24-bit Matte (${matteColor === '#070A12' ? 'Dark' : 'White'} Flatten)`
           : 'Transparansi PNG akan diratakan ke sRGB saat optimasi'
       }
     ];
 
+    if (mpMode) {
+      const isJpg = sourceItem.format === 'JPEG' || sourceItem.format === 'JPG';
+      const srcBpp = (sourceItem.sizeBytes * 8) / (sourceItem.width * sourceItem.height);
+      const srcLow = isJpg && srcBpp < 0.6;
+      const outQ = optimizedResult ? optimizedResult.rawQuality : null;
+      const qLow = outQ !== null && outQ < 0.9;
+      const compPass = !srcLow && !qLow;
+      gates.push({
+        id: 'compression',
+        title: '7. Kompresi Gate (Adobe)',
+        pass: compPass,
+        badge: compPass ? 'KOMPRESI AMAN' : srcLow ? 'SUMBER TERLALU TERKOMPRES' : 'KUALITAS JPEG RENDAH',
+        detail: (isJpg ? `Sumber ${srcBpp.toFixed(2)} bit/piksel (ideal ≥ 0.6)` : 'Sumber bukan JPEG, aman dari kompresi ganda')
+          + (outQ !== null ? ` • Hasil q=${(outQ * 100).toFixed(1)}%` : '')
+          + (srcLow ? '. Upscale tidak memperbaiki artefak; ekspor ulang dari file master.' : '')
+      });
+    }
+
     const passedCount = gates.filter((g) => g.pass).length;
-    return { gates, passedCount, totalCount: 6, needsEdgeFitSuggestion, previewCropGeom };
+    return { gates, passedCount, totalCount: gates.length, needsEdgeFitSuggestion, previewCropGeom };
   }, [sourceItem, optimizedResult, activePreset, matteColor]);
 
   const isDark = theme === 'dark';
@@ -1518,10 +1606,10 @@ function PixelVaultApplication() {
                       <div>
                         <div className="font-bold text-slate-200 flex items-center gap-1.5">
                           <Maximize2 className="w-3.5 h-3.5 text-cyan-400" />
-                          Upscale ke Ukuran Minimum Preset
+                          {activePreset.mpMode ? 'Upscale ke Minimum 4 MP' : 'Upscale ke Ukuran Minimum Preset'}
                         </div>
                         <p className="text-[11px] text-slate-400 mt-0.5">
-                          Memperbesar piksel sampai sisi minimum preset ({activePreset.minShortSide} × {activePreset.minLongSide} px) dengan interpolasi. Bukan AI: ukuran jadi memenuhi syarat, tetapi detail baru tidak muncul.
+                          {activePreset.mpMode ? `Hanya aktif jika gambar di bawah ${activePreset.minMP} MP: diperbesar ke sekitar ${activePreset.minMP} MP (batas ${activePreset.upscaleCapMP} MP) dengan interpolasi. Adobe menyarankan menghindari upscale; pakai hanya jika terpaksa.` : `Memperbesar piksel sampai sisi minimum preset (${activePreset.minShortSide} × ${activePreset.minLongSide} px) dengan interpolasi.`} Bukan AI: ukuran jadi memenuhi syarat, tetapi detail baru tidak muncul.
                         </p>
                       </div>
                       <button
@@ -1927,13 +2015,13 @@ function PixelVaultApplication() {
                       Displate & Marketplace Pre-Flight Compliance Gate (6-Point Audit)
                     </h3>
                     <p className="text-[11px] text-slate-400">
-                      Verifikasi otomatis 6 syarat teknis cetak sebelum di-upload ke portal Displate / Marketplace.
+                      Verifikasi otomatis syarat teknis cetak sebelum di-upload ke portal Displate / Marketplace.
                     </p>
                   </div>
                   {preFlightGates && (
                     <span
                       className={`px-3 py-1 rounded-full text-xs font-bold font-mono ${
-                        preFlightGates.passedCount === 6
+                        preFlightGates.passedCount === preFlightGates.totalCount
                           ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                           : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                       }`}
