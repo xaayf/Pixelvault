@@ -17,6 +17,7 @@ export const DEFECT_TYPES = {
   stain: { label: 'Noda', color: '#f43f5e', hint: 'Bercak warna/terang yang berdiri sendiri dan berbeda dari sekitarnya.' },
   block: { label: 'Blok JPEG', color: '#a78bfa', hint: 'Pola kotak 8×8 akibat kompresi.' },
   sym: { label: 'Asimetri', color: '#22d3ee', hint: 'Berbeda dari bayangan cermin sisi seberang.' },
+  smear: { label: 'Olesan', color: '#ec4899', hint: 'Tekstur lembek/berlilin atau seperti olesan cat dibanding sekitarnya (ciri upscale AI).' },
 };
 
 export async function scanImage(img, opts = {}, onProgress = () => {}, shouldCancel = () => false) {
@@ -294,4 +295,200 @@ export async function scanImage(img, opts = {}, onProgress = () => {}, shouldCan
     W, H, T, cols, rows, tiles, findings,
     stats: { sharpMedian: sharpMed, symCorr, flaggedTiles: ranked.length },
   };
+}
+
+
+// ---------------------------------------------------------------------------
+// Mode Mikro: tile kecil (32px) pada resolusi asli untuk cacat halus hasil upscale AI.
+// ---------------------------------------------------------------------------
+export async function scanMicro(img, opts = {}, onProgress = () => {}, shouldCancel = () => false) {
+  const { sensitivity = 1, maxFindings = 12 } = opts;
+  const k = sensitivity;
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+  const T = 32;
+  const M = 8; // margin baris agar filter di batas strip tetap benar
+  const cols = Math.max(1, Math.floor(W / T));
+  const rows = Math.max(1, Math.floor(H / T));
+  const tileH = (cy) => (cy === rows - 1 ? H - cy * T : T);
+  const tileW = (cx) => (cx === cols - 1 ? W - cx * T : T);
+  const N = cols * rows;
+
+  const hfS = new Float64Array(N), mfS = new Float64Array(N), cnt = new Float64Array(N);
+  const sumL = new Float64Array(N), sumL2 = new Float64Array(N);
+  const eCnt = new Float64Array(N), ringBase = new Float64Array(N), ring = new Float64Array(N);
+  const pairs = new Float64Array(N), dth = new Float64Array(N);
+
+  const cv = document.createElement('canvas');
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  const I = new Float64Array((W + 1) * (T + 2 * M + 1));
+
+  for (let cy = 0; cy < rows; cy++) {
+    const y0 = cy * T;
+    const th = tileH(cy);
+    const ys = Math.max(0, y0 - M);
+    const ye = Math.min(H, y0 + th + M);
+    const hs = ye - ys;
+    cv.width = W;
+    cv.height = hs;
+    ctx.drawImage(img, 0, ys, W, hs, 0, 0, W, hs);
+    const d = ctx.getImageData(0, 0, W, hs).data;
+    const L = new Float32Array(W * hs);
+    for (let i = 0, p = 0; i < L.length; i++, p += 4) L[i] = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+    // integral image
+    const stride = W + 1;
+    for (let x = 0; x <= W; x++) I[x] = 0;
+    for (let y = 0; y < hs; y++) {
+      let row = 0;
+      I[(y + 1) * stride] = 0;
+      for (let x = 0; x < W; x++) {
+        row += L[y * W + x];
+        I[(y + 1) * stride + x + 1] = I[y * stride + x + 1] + row;
+      }
+    }
+    const mean = (x, y, r) => {
+      const xa = Math.max(0, x - r), xb = Math.min(W - 1, x + r);
+      const ya = Math.max(0, y - r), yb = Math.min(hs - 1, y + r);
+      const a = I[(yb + 1) * stride + xb + 1] - I[ya * stride + xb + 1] - I[(yb + 1) * stride + xa] + I[ya * stride + xa];
+      return a / ((xb - xa + 1) * (yb - ya + 1));
+    };
+
+    const lyStart = y0 - ys;
+    for (let ly = lyStart; ly < lyStart + th; ly++) {
+      if (ly < 1 || ly >= hs - 1) continue;
+      let prevTheta = NaN;
+      for (let x = 1; x < W - 1; x++) {
+        const cx = Math.min(cols - 1, Math.floor(x / T));
+        const t = cy * cols + cx;
+        const i = ly * W + x;
+        const l = L[i];
+        const b1 = mean(x, ly, 1);
+        const b4 = mean(x, ly, 4);
+        hfS[t] += Math.abs(l - b1);
+        mfS[t] += Math.abs(b1 - b4);
+        sumL[t] += l;
+        sumL2[t] += l * l;
+        cnt[t]++;
+        const gx = (L[i + 1] - L[i - 1]) / 2;
+        const gy = (L[i + W] - L[i - W]) / 2;
+        const g = Math.sqrt(gx * gx + gy * gy);
+        if (g > 40) {
+          eCnt[t]++;
+          let th2 = Math.atan2(gy, gx);
+          if (th2 < 0) th2 += Math.PI; // orientasi tanpa arah
+          if (!Number.isNaN(prevTheta)) {
+            let dd = Math.abs(th2 - prevTheta);
+            if (dd > Math.PI / 2) dd = Math.PI - dd;
+            dth[t] += dd;
+            pairs[t]++;
+          }
+          prevTheta = th2;
+          // Halo: profil sepanjang arah gradien
+          let ux = gx / g, uy = gy / g;
+          const at = (o) => {
+            const xx = x + Math.round(ux * o), yy = ly + Math.round(uy * o);
+            if (xx < 0 || xx >= W || yy < 0 || yy >= hs) return null;
+            return L[yy * W + xx];
+          };
+          let p2 = at(2), m2 = at(-2);
+          if (p2 !== null && m2 !== null) {
+            if (p2 < m2) { ux = -ux; uy = -uy; }
+            p2 = at(2); m2 = at(-2);
+            const p4 = at(4), m4 = at(-4);
+            if (p4 !== null && m4 !== null && Math.abs(p2 - m2) > 40) {
+              ringBase[t]++;
+              { const A = Math.abs(p2 - m2); if (p4 < p2 - 0.1 * A && m4 > m2 + 0.1 * A) ring[t]++; }
+            }
+          }
+        } else {
+          prevTheta = NaN;
+        }
+      }
+    }
+    onProgress(0.05 + 0.85 * ((cy + 1) / rows));
+    await nextFrame();
+    if (shouldCancel()) return null;
+  }
+
+  const at2 = (cx, cy) => (cx < 0 || cy < 0 || cx >= cols || cy >= rows ? -1 : cy * cols + cx);
+  // Pembanding: jendela ±8 tile (~256px) tanpa 3×3 di tengah, agar area cacat yang lebih besar
+  // dari satu tile tidak menjadi pembanding dirinya sendiri.
+  const RAD = 8;
+  const nbrs = (cx, cy) => {
+    const out = [];
+    for (let dy = -RAD; dy <= RAD; dy++) for (let dx = -RAD; dx <= RAD; dx++) {
+      if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) continue;
+      const j = at2(cx + dx, cy + dy);
+      if (j >= 0) out.push(j);
+    }
+    return out;
+  };
+
+  const hf = new Float64Array(N), q = new Float64Array(N), sd = new Float64Array(N), ringF = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    if (!cnt[i]) continue;
+    hf[i] = hfS[i] / cnt[i];
+    q[i] = mfS[i] / cnt[i] / (hf[i] + 0.3);
+    const m = sumL[i] / cnt[i];
+    sd[i] = Math.sqrt(Math.max(0, sumL2[i] / cnt[i] - m * m));
+    ringF[i] = ringBase[i] >= 30 ? ring[i] / ringBase[i] : -1;
+  }
+
+  const smear = new Float64Array(N), halo = new Float64Array(N);
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const i = cy * cols + cx;
+      const nb = nbrs(cx, cy);
+      // Olesan: detail halus hilang tetapi struktur menengah tetap ada (seperti cat/lilin).
+      // Area yang memang halus (langit, gradasi) tidak ikut, karena energi menengahnya juga rendah.
+      if (sd[i] > 6) {
+        const tex = nb.filter((j) => hf[j] > 1.5);
+        if (tex.length >= 20) {
+          const mn = median(tex.map((j) => hf[j]));
+          const mq = median(tex.map((j) => q[j]));
+          const rq = mq > 0 ? q[i] / mq : 0;
+          const sD = clamp01((rq - 1.8 * k) / (1.2 * k));
+          const rA = hf[i] / mn;
+          const sA = rq >= 1.2 ? clamp01((0.5 / k - rA) / (0.5 / k - 0.2 / k)) : 0;
+          smear[i] = Math.max(sD, 0.8 * sA);
+        }
+      }
+      // Halo
+      if (ringF[i] >= 0) {
+        const rn = nb.filter((j) => ringF[j] >= 0);
+        if (rn.length >= 12) {
+          const mr = median(rn.map((j) => ringF[j]));
+          halo[i] = clamp01((ringF[i] - mr - 0.25 * k) / (0.3 * k));
+        }
+      }
+    }
+  }
+  onProgress(0.95);
+
+  // Halo tepi dan tepi bergelombang sudah dicoba tetapi belum andal (terlalu banyak tanda palsu pada tepi alami),
+  // jadi tidak dilaporkan. Perhitungan halo dibiarkan di atas hanya sebagai data mentah.
+  const W_TYPE = { smear: 1, halo: 0 };
+  const tiles = [];
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const i = cy * cols + cx;
+      const sc = { smear: smear[i], halo: halo[i] };
+      let type = 'smear', top = 0;
+      for (const key of Object.keys(sc)) {
+        const v = sc[key] * W_TYPE[key];
+        if (v > top) { top = v; type = key; }
+      }
+      tiles.push({ cx, cy, i, x: cx * T, y: cy * T, w: tileW(cx), h: tileH(cy), scores: sc, type, score: top, raw: { ringF: ringF[i], ringBase: ringBase[i], hf: hf[i], q: q[i] } });
+    }
+  }
+  const ranked = tiles.filter((t) => t.score >= 0.3).sort((a, b) => b.score - a.score);
+  const findings = [];
+  for (const t of ranked) {
+    if (findings.length >= maxFindings) break;
+    if (findings.filter((f) => f.type === t.type).length >= 4) continue;
+    if (findings.some((f) => Math.max(Math.abs(f.cx - t.cx), Math.abs(f.cy - t.cy)) < 4)) continue;
+    findings.push(t);
+  }
+  onProgress(1);
+  return { W, H, T, cols, rows, tiles, findings, stats: { sharpMedian: median(Array.from(hf)), symCorr: null, flaggedTiles: ranked.length } };
 }

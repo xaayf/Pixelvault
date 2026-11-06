@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ScanSearch, Loader2, Crosshair, X } from 'lucide-react';
-import { scanImage, DEFECT_TYPES } from './detector.js';
+import { scanImage, scanMicro, DEFECT_TYPES } from './detector.js';
 
 const ZOOMS = [100, 200, 400];
 const CROP = 160; // piksel kanvas
@@ -26,6 +26,7 @@ function CropCanvas({ img, cx, cy, zoom }) {
 export default function DefectScanner({ imageUrl, isDark, onOpenLoupe }) {
   const [sensitivity, setSensitivity] = useState(1);
   const [symmetry, setSymmetry] = useState('off');
+  const [mode, setMode] = useState('standar'); // 'standar' | 'mikro'
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState(null);
@@ -57,7 +58,9 @@ export default function DefectScanner({ imageUrl, isDark, onOpenLoupe }) {
         i.onerror = () => rej(new Error('Gambar gagal dimuat'));
         i.src = imageUrl;
       });
-      const out = await scanImage(img, { sensitivity, symmetry }, setProgress, () => cancelRef.current);
+      const out = mode === 'mikro'
+        ? await scanMicro(img, { sensitivity }, setProgress, () => cancelRef.current)
+        : await scanImage(img, { sensitivity, symmetry }, setProgress, () => cancelRef.current);
       if (out) {
         setImgEl(img);
         setResult(out);
@@ -127,9 +130,24 @@ export default function DefectScanner({ imageUrl, isDark, onOpenLoupe }) {
           <ScanSearch className="w-4 h-4 text-cyan-400" /> Pemindai Cacat Visual
         </h3>
         <p className="text-xs text-slate-400 mt-1">
-          Mencari area curiga (blur, noda, blok JPEG, asimetri) lalu menampilkannya di zoom 100/200/400%. Ini penyaring otomatis berbasis algoritma, bukan AI:
+          Mencari area curiga (blur, noda, blok JPEG, asimetri, olesan) lalu menampilkannya di zoom 100/200/400%. Ini penyaring otomatis berbasis algoritma, bukan AI:
           jari berlebih atau anatomi janggal <strong>tidak</strong> terdeteksi, dan bagian yang sengaja buram atau asimetris bisa ikut ditandai.
         </p>
+      </div>
+
+      <div className="space-y-1.5 text-xs">
+        <div className="font-semibold text-slate-300">Mode pindai</div>
+        <div className="flex gap-1 p-1 rounded-xl bg-slate-950 border border-white/10">
+          {[['standar', 'Standar (blur, noda, blok, simetri)'], ['mikro', 'Mikro (olesan hasil upscale)']].map(([v, l]) => (
+            <button key={v} type="button" onClick={() => { setMode(v); setResult(null); }}
+              className={`flex-1 px-2 py-1.5 rounded-lg font-bold transition ${mode === v ? 'bg-gradient-to-r from-cyan-500 to-indigo-500 text-white' : 'text-slate-400'}`}>
+              {l}
+            </button>
+          ))}
+        </div>
+        {mode === 'mikro' && (
+          <p className="text-[11px] text-slate-400">Tile 32px pada resolusi asli untuk mencari olesan: tekstur lembek/berlilin hasil upscale AI. Halo tepi dan tepi bergelombang belum andal, jadi belum dilaporkan. Area yang berolesan merata di seluruh gambar tidak ditandai, karena pembandingnya adalah sekitar; periksa dengan zoom.</p>
+        )}
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
@@ -144,7 +162,7 @@ export default function DefectScanner({ imageUrl, isDark, onOpenLoupe }) {
             ))}
           </div>
         </div>
-        <div className="space-y-1.5">
+        {mode === 'standar' && <div className="space-y-1.5">
           <div className="font-semibold text-slate-300">Cek simetri cermin</div>
           <div className="flex gap-1 p-1 rounded-xl bg-slate-950 border border-white/10">
             {[['off', 'Mati'], ['vertical', 'Kiri↔Kanan'], ['horizontal', 'Atas↔Bawah']].map(([v, l]) => (
@@ -154,7 +172,7 @@ export default function DefectScanner({ imageUrl, isDark, onOpenLoupe }) {
               </button>
             ))}
           </div>
-        </div>
+        </div>}
       </div>
 
       <div className="flex items-center gap-3">
