@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import DefectScanner from './DefectScanner.jsx';
 import {
   ShieldCheck, Sparkles, Sliders, UploadCloud, Download, Layers, ZoomIn,
   CheckCircle2, AlertTriangle, Info, RefreshCw, Trash2, Settings, Sun, Moon,
@@ -2100,7 +2101,7 @@ function PixelVaultApplication() {
         {activeTab === 'inspect' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
             {/* Left 7 Cols: Interactive Split-Screen Before/After Slider + 100%/200%/400% Dual Loupe */}
-            <div className={`lg:col-span-7 p-5 rounded-2xl border ${isDark ? 'bg-slate-900/80 border-white/10' : 'bg-white border-slate-200'} backdrop-blur-xl space-y-5`}>
+            <div id="pv-inspector" className={`lg:col-span-7 p-5 rounded-2xl border ${isDark ? 'bg-slate-900/80 border-white/10' : 'bg-white border-slate-200'} backdrop-blur-xl space-y-5`}>
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="font-bold text-base flex items-center gap-2">
@@ -2327,6 +2328,17 @@ function PixelVaultApplication() {
                   </p>
                 </div>
               )}
+            </div>
+
+            <div className="lg:col-span-12">
+              <DefectScanner
+                imageUrl={optimizedResult ? optimizedResult.outputUrl : sourceItem?.previewUrl}
+                isDark={isDark}
+                onOpenLoupe={(x, y) => {
+                  setZoomPoint({ x, y });
+                  document.getElementById('pv-inspector')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+              />
             </div>
           </div>
         )}
