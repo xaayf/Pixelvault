@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import GlassSelect from './GlassSelect.jsx';
-import { Shapes, Loader2, Download, AlertTriangle, CheckCircle2, UploadCloud, Archive } from 'lucide-react';
+import { Shapes, Loader2, Download, AlertTriangle, CheckCircle2, UploadCloud, Archive, Wand2 } from 'lucide-react';
 import { DETAIL_LEVELS, SMOOTHNESS, RATIOS, DEFAULT_LIMITS, meanAbsDiff } from './vectorize.js';
 import { makeZip } from './zip.js';
 
@@ -47,6 +47,9 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
+  const [auto, setAuto] = useState(true);
+  const [analysis, setAnalysis] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
   const workerRef = useRef(null);
   const reqRef = useRef(0);
 
@@ -54,7 +57,52 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
   const name = (ownUrl ? ownName : baseName) || 'trace';
 
   useEffect(() => () => { workerRef.current?.terminate(); if (ownUrl) URL.revokeObjectURL(ownUrl); }, []); // eslint-disable-line
-  useEffect(() => { setResult(null); setError(''); }, [srcUrl]);
+  useEffect(() => { setResult(null); setError(''); setAuto(true); }, [srcUrl]);
+  // Deteksi otomatis: ukur karakter gambar (sisi pendek 800 px) lalu isi pengaturan. Mengubah kontrol manual mematikan mode otomatis.
+  const applySettings = (st) => {
+    if (!st) return;
+    setColors(st.colors); setEdge(st.edge); setSmoothness(st.smoothness); setBgTol(st.bgTol); setRemoveBg(st.removeBg); setShadow(st.shadow);
+  };
+  const autoRef = useRef(true);
+  useEffect(() => { autoRef.current = auto; }, [auto]);
+  useEffect(() => {
+    if (!srcUrl) { setAnalysis(null); return undefined; }
+    let dead = false;
+    let worker = null;
+    const timer = setTimeout(async () => {
+      setAnalyzing(true);
+      try {
+        const img = await loadImage(srcUrl);
+        const k = Math.min(1, 800 / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.max(1, Math.round(img.naturalWidth * k));
+        const h = Math.max(1, Math.round(img.naturalHeight * k));
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d', { willReadFrequently: true });
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, 0, 0, w, h);
+        const buf = ctx.getImageData(0, 0, w, h).data.buffer.slice(0);
+        worker = new Worker(new URL('./vectorWorker.js', import.meta.url), { type: 'module' });
+        const out = await new Promise((res, rej) => {
+          worker.onmessage = (ev) => (ev.data.ok ? res(ev.data) : rej(new Error(ev.data.error)));
+          worker.onerror = (ev) => rej(new Error(ev.message || 'Analisis gagal'));
+          worker.postMessage({ id: 0, kind: 'analyze', width: w, height: h, buffer: buf, opts: { limits: { maxNodes, maxColors }, naturalLong: Math.max(img.naturalWidth, img.naturalHeight) } }, [buf]);
+        });
+        if (dead) return;
+        setAnalysis(out);
+        if (autoRef.current) applySettings(out.settings);
+      } catch { if (!dead) setAnalysis(null); } finally {
+        worker?.terminate();
+        if (!dead) setAnalyzing(false);
+      }
+    }, 350);
+    return () => { dead = true; clearTimeout(timer); worker?.terminate(); };
+  }, [srcUrl, maxColors]); // eslint-disable-line
+
+  const man = (fn) => (v) => { setAuto(false); fn(v); };
+  const turnAuto = (on) => { setAuto(on); if (on && analysis) applySettings(analysis.settings); };
+
 
   const pickFile = (e) => {
     const f = e.target.files?.[0];
@@ -196,38 +244,78 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
         <div className={`py-10 text-center text-xs ${sub}`}>Pilih gambar, atau muat gambar di tab Studio dulu.</div>
       ) : (
         <>
+          <div className={`rounded-xl border p-3 space-y-2 backdrop-blur-md ${isDark ? 'border-white/10 bg-white/[0.04]' : 'border-slate-200 bg-white/60'}`}>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                {analyzing ? <Loader2 className="w-4 h-4 animate-spin text-cyan-400" /> : <Wand2 className="w-4 h-4 text-cyan-400" />}
+                Pengaturan otomatis
+                {analysis?.profile && !analyzing && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-medium border border-cyan-500/30 text-cyan-300">
+                    {analysis.profile === 'garis-tipis' ? 'Garis tipis' : analysis.profile === 'gradasi' ? 'Gradasi / painterly' : 'Stiker / bentuk tebal'}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={auto}
+                aria-label="Pengaturan otomatis"
+                onClick={() => turnAuto(!auto)}
+                disabled={!analysis?.settings}
+                className={`relative h-6 w-11 rounded-full border transition-colors disabled:opacity-40 ${auto ? 'bg-cyan-500/70 border-cyan-400/60' : isDark ? 'bg-white/10 border-white/20' : 'bg-slate-200 border-slate-300'}`}
+              >
+                <span className={`absolute top-0.5 h-4.5 w-4.5 rounded-full bg-white shadow transition-all ${auto ? 'left-[22px]' : 'left-0.5'}`} style={{ height: 18, width: 18 }} />
+              </button>
+            </div>
+            {analysis?.settings && (
+              <p className={`text-[11px] leading-relaxed ${sub}`}>
+                {auto ? 'Terdeteksi: ' : 'Saran otomatis: '}
+                <span className={isDark ? 'text-slate-200' : 'text-slate-700'}>
+                  {analysis.settings.edge}px, {analysis.settings.colors} warna, kurva {SMOOTHNESS[analysis.settings.smoothness]?.label.split(' (')[0].toLowerCase()}, toleransi latar {analysis.settings.bgTol}
+                </span>
+                . {analysis.reasons.join('; ')}.
+                {!auto && ' Kamu sudah mengubah pengaturan manual.'}
+              </p>
+            )}
+            {analysis?.warnings?.length > 0 && (
+              <ul className="space-y-1">
+                {analysis.warnings.map((w, i) => <li key={i} className="text-[11px] text-amber-400 flex gap-1.5"><AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />{w}</li>)}
+              </ul>
+            )}
+          </div>
+
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
             <label className="text-[11px] space-y-1">
               <span className={sub}>Jumlah warna: {colors}</span>
-              <input type="range" min={4} max={24} value={colors} onChange={(e) => setColors(+e.target.value)} className="w-full" />
+              <input type="range" min={4} max={24} value={colors} onChange={(e) => man(setColors)(+e.target.value)} className="w-full" />
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Detail (hanya untuk mode lama)</span>
-              <GlassSelect isDark={isDark} ariaLabel="Detail" value={detail} onChange={setDetail} options={Object.entries(DETAIL_LEVELS).map(([k, v]) => ({ value: k, label: v.label }))} />
+              <GlassSelect isDark={isDark} ariaLabel="Detail" value={detail} onChange={man(setDetail)} options={Object.entries(DETAIL_LEVELS).map(([k, v]) => ({ value: k, label: v.label }))} />
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Sisi terpanjang kerja</span>
-              <GlassSelect isDark={isDark} ariaLabel="Sisi terpanjang kerja" value={edge} onChange={(v) => setEdge(+v)} options={EDGES.map((v) => ({ value: v, label: `${v}px${v === 1400 ? ' (disarankan)' : ''}` }))} />
+              <GlassSelect isDark={isDark} ariaLabel="Sisi terpanjang kerja" value={edge} onChange={(v) => man(setEdge)(+v)} options={EDGES.map((v) => ({ value: v, label: `${v}px${analysis?.settings?.edge === v ? ' (disarankan)' : ''}` }))} />
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Kehalusan kurva</span>
-              <GlassSelect isDark={isDark} ariaLabel="Kehalusan kurva" value={smoothness} onChange={setSmoothness} options={Object.entries(SMOOTHNESS).map(([k, v]) => ({ value: k, label: v.label }))} />
+              <GlassSelect isDark={isDark} ariaLabel="Kehalusan kurva" value={smoothness} onChange={man(setSmoothness)} options={Object.entries(SMOOTHNESS).map(([k, v]) => ({ value: k, label: v.label }))} />
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Rasio kanvas SVG</span>
               <GlassSelect isDark={isDark} ariaLabel="Rasio kanvas SVG" value={ratio} onChange={setRatio} options={Object.entries(RATIOS).map(([k, v]) => ({ value: k, label: v.label }))} />
             </label>
             <label className="text-[11px] flex items-center gap-2 min-h-[40px]">
-              <input type="checkbox" checked={removeBg} onChange={(e) => setRemoveBg(e.target.checked)} className="w-5 h-5" />
+              <input type="checkbox" checked={removeBg} onChange={(e) => man(setRemoveBg)(e.target.checked)} className="w-5 h-5" />
               <span>Buang latar otomatis</span>
             </label>
             <label className={`text-[11px] flex items-center gap-2 min-h-[40px] ${removeBg ? '' : 'opacity-40'}`}>
-              <input type="checkbox" checked={shadow} disabled={!removeBg} onChange={(e) => setShadow(e.target.checked)} className="w-5 h-5" />
+              <input type="checkbox" checked={shadow} disabled={!removeBg} onChange={(e) => man(setShadow)(e.target.checked)} className="w-5 h-5" />
               <span>Buang bayangan lembut</span>
             </label>
             <label className={`text-[11px] space-y-1 ${removeBg ? '' : 'opacity-40'}`}>
               <span className={sub}>Toleransi latar: {bgTol}</span>
-              <input type="range" min={2} max={30} value={bgTol} disabled={!removeBg} onChange={(e) => setBgTol(+e.target.value)} className="w-full" />
+              <input type="range" min={2} max={30} value={bgTol} disabled={!removeBg} onChange={(e) => man(setBgTol)(+e.target.value)} className="w-full" />
             </label>
             <div className="grid grid-cols-2 gap-2 text-[11px]">
               <label className="space-y-1"><span className={sub}>Maks titik</span>

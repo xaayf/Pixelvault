@@ -27,6 +27,8 @@ export const SMOOTHNESS = {
 };
 
 export const DEFAULT_LIMITS = { maxNodes: 20000, maxColors: 16 };
+// Ambang gabung warna palet (deltaE Lab). 8 masih menyisakan 3 corak emas yang tepinya bergerigi pada gradasi; 10-12 bersih.
+const MERGE_DE = 10;
 
 // ---------- warna ----------
 const LIN = new Float32Array(256);
@@ -171,7 +173,7 @@ export function separateObjects(bgMask, w, h, { minRel = 0.01, minAbs = 120 } = 
 // ---------- palet (Lab, seimbang terhadap luas) ----------
 // Histogram Lab berbin -> k-means berbobot sqrt(jumlah piksel). Bobot akar mencegah warna dominan (cokelat) menelan
 // warna kecil (hijau daun) yang tetap penting secara visual, tetapi bin yang sangat langka (antialias) diabaikan.
-export function buildPalette(data, labels, k, flat) {
+export function buildPalette(data, labels, k, flat, mergeDE = MERGE_DE) {
   const total = labels.length;
   const stride = Math.max(1, Math.floor(total / 300000));
   const bins = new Map();
@@ -217,11 +219,30 @@ export function buildPalette(data, labels, k, flat) {
     }
     acc.forEach((a, c) => { if (a[3] > 0) cents[c] = [a[0] / a[3], a[1] / a[3], a[2] / a[3]]; });
   }
-  // gabung warna yang nyaris sama (selisih persepsi kecil)
-  const merged = [];
-  cents.forEach((c) => {
-    if (!merged.some((m) => Math.sqrt((m[0] - c[0]) ** 2 + (m[1] - c[1]) ** 2 + (m[2] - c[2]) ** 2) < 5)) merged.push(c);
-  });
+  // Gabung warna yang selisih persepsinya kecil (deltaE Lab < mergeDE), berbobot jumlah piksel. Gradasi emas yang terbelah
+  // k-means jadi 3-4 corak dilebur kembali sehingga tidak muncul bercak; warna berbeda sungguhan (hijau muda vs tua) tetap.
+  const wts = cents.map(() => 0);
+  for (const e of ents) {
+    let b = 0, bd = Infinity;
+    for (let c = 0; c < cents.length; c++) { const dd = d2(e, cents[c]); if (dd < bd) { bd = dd; b = c; } }
+    wts[b] += e.n;
+  }
+  let merged = cents.map((c, i) => ({ c: c.slice(), n: wts[i] })).filter((m) => m.n > 0);
+  for (;;) {
+    let bi = -1, bj = -1, bd = mergeDE;
+    for (let i = 0; i < merged.length; i++) {
+      for (let j = i + 1; j < merged.length; j++) {
+        const dd = Math.hypot(merged[i].c[0] - merged[j].c[0], merged[i].c[1] - merged[j].c[1], merged[i].c[2] - merged[j].c[2]);
+        if (dd < bd) { bd = dd; bi = i; bj = j; }
+      }
+    }
+    if (bi < 0) break;
+    const A = merged[bi], B = merged[bj], n = A.n + B.n;
+    A.c = [0, 1, 2].map((q) => (A.c[q] * A.n + B.c[q] * B.n) / n);
+    A.n = n;
+    merged.splice(bj, 1);
+  }
+  merged = merged.sort((a, b) => b.n - a.n).map((m) => m.c);
   return merged.map((c) => {
     const [r, g, b] = lab2rgb(c[0], c[1], c[2]);
     return { r, g, b, a: 255, lab: c };
@@ -492,7 +513,90 @@ function despeckle(lab, cw, ch, K, minArea) {
 // Mesin kurva: lapisan bertumpuk. Warna diurutkan dari luas terbesar; lapisan ke-r berisi semua piksel berperingkat >= r,
 // jadi lapisan bawah selalu menjulur di bawah lapisan atas (tanpa celah/seam). Tiap mask diburamkan lalu dikonturkan
 // pada level 0.5 (sub-piksel) dan dicocokkan ke Bezier kubik.
-function traceStacked(lab, cw, ch, pal, f, tol, blurPx) {
+// Naikkan resolusi label dengan tetangga terdekat (tanpa informasi warna sumber).
+function nearestUp(lab, cw, ch, f) {
+  const W = cw * f, H = ch * f;
+  const up = new Int16Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const sy = ((y / f) | 0) * cw;
+    for (let x = 0; x < W; x++) up[y * W + x] = lab[sy + ((x / f) | 0)];
+  }
+  return up;
+}
+
+// Naikkan resolusi label dengan menentukan warna ulang di resolusi tinggi: warna sumber diinterpolasi bilinear (Lab),
+// kandidat label = label empat piksel penyangga interpolasi. Satu kandidat -> itu; beberapa -> proyeksikan ke ruas antar-
+// pasangan kandidat dan ambil sisi t<0.5. Hasilnya batas antarwarna jatuh tepat di titik tengah antialias (akurasi sub-piksel),
+// jadi garis tipis tidak melebar dan lingkaran tidak berlekuk oleh derau label 1 piksel.
+function refineLabels(lab, cw, ch, f, pal, { data, w, x0, y0 }) {
+  const W = cw * f, H = ch * f;
+  const L3 = new Float32Array(cw * ch * 3);
+  const tmp = [0, 0, 0];
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      const p = y * cw + x;
+      if (lab[p] < 0) continue;
+      const i = ((y + y0) * w + (x + x0)) * 4;
+      rgb2lab(data[i], data[i + 1], data[i + 2], tmp);
+      L3[p * 3] = tmp[0]; L3[p * 3 + 1] = tmp[1]; L3[p * 3 + 2] = tmp[2];
+    }
+  }
+  const up = new Int16Array(W * H);
+  const cand = [0, 0, 0, 0];
+  const wt = [0, 0, 0, 0];
+  const pidx = [0, 0, 0, 0];
+  for (let y = 0; y < H; y++) {
+    const fy = (y + 0.5) / f - 0.5;
+    const y0i = Math.floor(fy), ty = fy - y0i;
+    const nearY = Math.min(ch - 1, Math.max(0, Math.round(fy)));
+    for (let x = 0; x < W; x++) {
+      const fx = (x + 0.5) / f - 0.5;
+      const x0i = Math.floor(fx), tx = fx - x0i;
+      const nx = Math.min(cw - 1, Math.max(0, Math.round(fx)));
+      const base = lab[nearY * cw + nx];
+      if (base < 0) { up[y * W + x] = -1; continue; }
+      let nc = 0, sw = 0, L = 0, A = 0, B = 0;
+      for (let q = 0; q < 4; q++) {
+        const xx = Math.min(cw - 1, Math.max(0, x0i + (q & 1)));
+        const yy = Math.min(ch - 1, Math.max(0, y0i + (q >> 1)));
+        const p = yy * cw + xx;
+        const v = lab[p];
+        if (v < 0) continue;
+        const wgt = (q & 1 ? tx : 1 - tx) * (q >> 1 ? ty : 1 - ty);
+        L += L3[p * 3] * wgt; A += L3[p * 3 + 1] * wgt; B += L3[p * 3 + 2] * wgt; sw += wgt;
+        let seen = false;
+        for (let u = 0; u < nc; u++) if (cand[u] === v) { seen = true; break; }
+        if (!seen) cand[nc++] = v;
+      }
+      if (nc <= 1 || sw <= 0) { up[y * W + x] = nc === 1 ? cand[0] : base; continue; }
+      L /= sw; A /= sw; B /= sw;
+      let best = base, bd = Infinity;
+      for (let u = 0; u < nc; u++) {
+        const qa = pal[cand[u]].lab;
+        const d0 = (L - qa[0]) ** 2 + (A - qa[1]) ** 2 + (B - qa[2]) ** 2;
+        if (d0 < bd) { bd = d0; best = cand[u]; }
+      }
+      for (let u = 0; u < nc; u++) {
+        const qa = pal[cand[u]].lab;
+        for (let v = u + 1; v < nc; v++) {
+          const qb = pal[cand[v]].lab;
+          const ex = qb[0] - qa[0], ey = qb[1] - qa[1], ez = qb[2] - qa[2];
+          const len2 = ex * ex + ey * ey + ez * ez;
+          if (len2 < 1) continue;
+          const t = ((L - qa[0]) * ex + (A - qa[1]) * ey + (B - qa[2]) * ez) / len2;
+          if (t < 0 || t > 1) continue;
+          const rx = L - qa[0] - t * ex, ry = A - qa[1] - t * ey, rz = B - qa[2] - t * ez;
+          const res = rx * rx + ry * ry + rz * rz;
+          if (res + 1e-6 < bd * 0.6) { bd = res / 0.6; best = t < 0.5 ? cand[u] : cand[v]; }
+        }
+      }
+      up[y * W + x] = best;
+    }
+  }
+  return up;
+}
+
+function traceStacked(lab, cw, ch, pal, f, tol, blurPx, refine) {
   const K = pal.length;
   const area = new Int32Array(K);
   for (let i = 0; i < lab.length; i++) if (lab[i] >= 0) area[lab[i]]++;
@@ -500,11 +604,7 @@ function traceStacked(lab, cw, ch, pal, f, tol, blurPx) {
   const rank = new Int16Array(K).fill(-1);
   order.forEach((c, r) => { rank[c] = r; });
   const W = cw * f, H = ch * f;
-  const up = new Int16Array(W * H);
-  for (let y = 0; y < H; y++) {
-    const sy = ((y / f) | 0) * cw;
-    for (let x = 0; x < W; x++) up[y * W + x] = lab[sy + ((x / f) | 0)];
-  }
+  const up = refine ? refineLabels(lab, cw, ch, f, pal, refine) : nearestUp(lab, cw, ch, f);
   const sg = blurPx * f; // sigma dalam piksel beresolusi tinggi; 3 box blur radius r punya sigma^2 = r(r+1)
   const r = Math.max(1, Math.round((-1 + Math.sqrt(1 + 4 * sg * sg)) / 2));
   const a = new Float32Array(W * H), b = new Float32Array(W * H);
@@ -574,7 +674,7 @@ function borderInfo(data, labels, w, h, o, x0, y0, cw, ch, pal) {
 export function traceImageData(imgd, opts = {}) {
   const {
     colors = 14, detail = 'sedang', removeBg = true, bgTol = 8, shadow = true, ratio = 'asli', marginRel = 0.06,
-    smooth = 2, rightAngle = false, smoothness = 'seimbang', artboardLong = 3000, limits = DEFAULT_LIMITS
+    smooth = 2, rightAngle = false, smoothness = 'seimbang', artboardLong = 3000, limits = DEFAULT_LIMITS, mergeDE = MERGE_DE, refine = true
   } = opts;
   const { width: w, height: h, data } = imgd;
   const lvl = DETAIL_LEVELS[detail] || DETAIL_LEVELS.sedang;
@@ -596,7 +696,7 @@ export function traceImageData(imgd, opts = {}) {
   for (let p = 0; p < labels.length; p++) if (!labels[p]) removed++;
 
   const flat = flatMask(data, labels, w, h);
-  const pal = buildPalette(data, labels, Math.max(2, Math.min(24, colors | 0)), flat);
+  const pal = buildPalette(data, labels, Math.max(2, Math.min(24, colors | 0)), flat, mergeDE);
   const idx = quantize(data, labels, flat, w, h, pal, smooth);
   const tracerPal = pal.map((c) => ({ r: c.r, g: c.g, b: c.b, a: 255 }));
   tracerPal.push({ r: 0, g: 0, b: 0, a: 0 });
@@ -622,7 +722,7 @@ export function traceImageData(imgd, opts = {}) {
       while (f > 2 && cw * f * ch * f > 4e6) f--;
       smoothOuterRing(lab, cw, ch, pal.length);
       despeckle(lab, cw, ch, pal.length, 8);
-      paths = traceStacked(lab, cw, ch, pal, f, curveTol, curveBlur);
+      paths = traceStacked(lab, cw, ch, pal, f, curveTol, curveBlur, refine ? { data, w, x0, y0 } : null);
     } else {
       const cd = new Uint8ClampedArray(cw * ch * 4);
       const sd = new Uint8ClampedArray(cw * ch * 4);
@@ -674,6 +774,143 @@ export function traceImageData(imgd, opts = {}) {
     palette: pal.map((c) => `#${[c.r, c.g, c.b].map((v) => v.toString(16).padStart(2, '0')).join('')}`),
     layout: { W: L.W, H: L.H, originX: L.offX, originY: L.offY },
     width: w, height: h
+  };
+}
+
+
+// ---------- deteksi otomatis ----------
+// Mengukur karakter gambar (lebar goresan, kerataan warna, jumlah warna sungguhan, derau latar, jumlah objek) pada versi
+// kecil (sisi panjang <= 800 px) lalu memetakannya ke pengaturan trace. Murni heuristik; ambang dikalibrasi pada garpu
+// art-deco (line-art tipis), stiker tebal, dan gambar sintetis, jadi sengaja konservatif dan semuanya bisa ditimpa manual.
+export const EDGE_CHOICES = [1000, 1400, 2000];
+
+function downscaleBox(imgd, maxLong) {
+  const { width: w, height: h, data } = imgd;
+  const k = Math.min(1, maxLong / Math.max(w, h));
+  if (k >= 1) return { width: w, height: h, data };
+  const nw = Math.max(1, Math.round(w * k)), nh = Math.max(1, Math.round(h * k));
+  const out = new Uint8ClampedArray(nw * nh * 4);
+  for (let y = 0; y < nh; y++) {
+    const ya = Math.floor((y * h) / nh), yb = Math.max(ya + 1, Math.floor(((y + 1) * h) / nh));
+    for (let x = 0; x < nw; x++) {
+      const xa = Math.floor((x * w) / nw), xb = Math.max(xa + 1, Math.floor(((x + 1) * w) / nw));
+      let r = 0, g = 0, b = 0, a = 0, n = 0;
+      for (let yy = ya; yy < yb; yy++) for (let xx = xa; xx < xb; xx++) { const i = (yy * w + xx) * 4; r += data[i]; g += data[i + 1]; b += data[i + 2]; a += data[i + 3]; n++; }
+      const o = (y * nw + x) * 4;
+      out[o] = r / n; out[o + 1] = g / n; out[o + 2] = b / n; out[o + 3] = a / n;
+    }
+  }
+  return { width: nw, height: nh, data: out };
+}
+
+// Setengah lebar lokal (px) tiap piksel objek: jarak ke batas warna/latar terdekat, lalu maksimum lokal radius 3 sehingga
+// piksel di tepi goresan ikut membawa nilai punggung goresannya.
+function halfWidths(idx, w, h) {
+  const INF = 1e4;
+  const d = new Int16Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = y * w + x, v = idx[p];
+      if (v < 0) { d[p] = 0; continue; }
+      const edge = x === 0 || y === 0 || x === w - 1 || y === h - 1 || idx[p - 1] !== v || idx[p + 1] !== v || idx[p - w] !== v || idx[p + w] !== v;
+      d[p] = edge ? 1 : INF;
+    }
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const p = y * w + x; if (d[p] > 1) d[p] = Math.min(d[p], (x > 0 ? d[p - 1] : INF) + 1, (y > 0 ? d[p - w] : INF) + 1); }
+  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) { const p = y * w + x; if (d[p] > 1) d[p] = Math.min(d[p], (x < w - 1 ? d[p + 1] : INF) + 1, (y < h - 1 ? d[p + w] : INF) + 1); }
+  const R = 3, t = new Int16Array(w * h), m = new Int16Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let mx = 0; for (let k = -R; k <= R; k++) { const xx = x + k; if (xx >= 0 && xx < w) mx = Math.max(mx, d[y * w + xx]); } t[y * w + x] = mx; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let mx = 0; for (let k = -R; k <= R; k++) { const yy = y + k; if (yy >= 0 && yy < h) mx = Math.max(mx, t[yy * w + x]); } m[y * w + x] = mx; }
+  for (let p = 0; p < m.length; p++) if (idx[p] < 0) m[p] = 0;
+  return m;
+}
+
+export function analyzeImage(imgd, { limits = DEFAULT_LIMITS, naturalLong = null } = {}) {
+  const sm = downscaleBox(imgd, 800);
+  const { width: w, height: h, data } = sm;
+  const long = Math.max(w, h);
+  const natLong = naturalLong || Math.max(imgd.width, imgd.height);
+  const reasons = [];
+  const warnings = [];
+
+  // latar: derau tepi -> toleransi
+  const cs = [];
+  const chromaAt = (x, y) => { const i = (y * w + x) * 4; return Math.max(data[i], data[i + 1], data[i + 2]) - Math.min(data[i], data[i + 1], data[i + 2]); };
+  for (let x = 0; x < w; x++) { cs.push(chromaAt(x, 0), chromaAt(x, h - 1)); }
+  for (let y = 0; y < h; y++) { cs.push(chromaAt(0, y), chromaAt(w - 1, y)); }
+  cs.sort((a, b) => a - b);
+  const noise = cs[Math.floor(cs.length * 0.95)] - cs[Math.floor(cs.length * 0.5)];
+  const bgTol = Math.max(8, Math.min(20, Math.round(8 + noise * 0.6)));
+  const bg = detectBackground(sm, { tol: bgTol, shadow: true });
+  const sep = separateObjects(bg.mask, w, h);
+  let labels = sep.labels, objs = sep.objects;
+  if (objs.length === 0) { labels = new Int32Array(w * h).fill(1); objs = [{ index: 1, area: w * h, x: 0, y: 0, w, h }]; }
+  let fg = 0;
+  for (let p = 0; p < labels.length; p++) if (labels[p]) fg++;
+  if (fg === 0) return { profile: 'kosong', settings: null, metrics: {}, reasons, warnings: ['Tidak ada objek terdeteksi.'] };
+
+  const flat = flatMask(data, labels, w, h);
+  let flatN = 0;
+  for (let p = 0; p < flat.length; p++) if (flat[p]) flatN++;
+  const flatFrac = flatN / fg;
+
+  const base = buildPalette(data, labels, 24, flat, MERGE_DE);
+  const natural = base.length;
+  const colors = Math.max(4, Math.min(limits.maxColors || 16, natural + 1));
+  const pal = natural > (limits.maxColors || 16) ? buildPalette(data, labels, colors, flat, MERGE_DE) : base;
+  const idx = quantize(data, labels, flat, w, h, pal, 1);
+  const hw = halfWidths(idx, w, h);
+  const vals = [];
+  for (let p = 0; p < hw.length; p++) if (idx[p] >= 0) vals.push(hw[p]);
+  vals.sort((a, b) => a - b);
+  const q = (f) => vals[Math.min(vals.length - 1, Math.floor(vals.length * f))] || 1;
+  let thin = 0;
+  const thinVals = [];
+  for (let i = 0; i < vals.length; i++) if (vals[i] <= 3) { thin++; thinVals.push(vals[i]); }
+  const thinFrac = thin / vals.length;
+  // setengah lebar tipikal goresan tipis (median di antara piksel goresan sempit), relatif terhadap sisi panjang gambar
+  const hwThin = thinVals.length ? thinVals[Math.floor(thinVals.length * 0.1)] : 4; // goresan paling tipis (persentil 10)
+  const hwRel = hwThin / long;
+  // kecocokan palet kecil: gambar flat memiliki sisa selisih warna rendah, gambar painterly/gradasi tinggi
+  let errSum = 0, errN = 0, bad = 0;
+  const lb = [0, 0, 0];
+  const stepP = Math.max(1, Math.floor(fg / 40000));
+  for (let p = 0; p < labels.length; p += stepP) {
+    if (!labels[p] || !flat[p]) continue;
+    const i = p * 4;
+    rgb2lab(data[i], data[i + 1], data[i + 2], lb);
+    let bd = Infinity;
+    for (const c of pal) { const dd = (lb[0] - c.lab[0]) ** 2 + (lb[1] - c.lab[1]) ** 2 + (lb[2] - c.lab[2]) ** 2; if (dd < bd) bd = dd; }
+    const de = Math.sqrt(bd);
+    errSum += de; errN++;
+    if (de > 12) bad++;
+  }
+  const fitErr = errN ? errSum / errN : 0;
+  const badFrac = errN ? bad / errN : 0;
+
+  // sisi kerja: setengah lebar goresan tipis pada resolusi kerja sebaiknya >= ~5 px (uji garpu: 1000 px menyatukan sinar tipis, 1400 masih bergelombang, 2000 tajam)
+  const need = thinFrac < 0.08 ? 0 : 5 / Math.max(hwRel, 1e-4);
+  let edge = EDGE_CHOICES.find((e) => e >= need) || EDGE_CHOICES[EDGE_CHOICES.length - 1];
+  if (natLong < edge) edge = [...EDGE_CHOICES].reverse().find((e) => e <= natLong) || EDGE_CHOICES[0];
+  const fine = thinFrac >= 0.08 && hwRel * edge < 3.5;
+
+  let profile = 'stiker';
+  if (badFrac > 0.12 || fitErr > 6) profile = 'gradasi';
+  else if (thinFrac > 0.18) profile = 'garis-tipis';
+  const smoothness = fine ? 'detail' : 'seimbang';
+
+  reasons.push(profile === 'garis-tipis' ? `Goresan tipis dominan (${(thinFrac * 100).toFixed(0)}% piksel berada di goresan sempit)` : profile === 'gradasi' ? `Banyak gradasi (rata-rata selisih ke palet ${fitErr.toFixed(1)} dE, ${(badFrac * 100).toFixed(0)}% piksel menyimpang jauh)` : `Bentuk tebal dan warna datar (selisih ke palet ${fitErr.toFixed(1)} dE)`);
+  reasons.push(`${natural} warna sungguhan setelah warna mirip digabung`);
+  if (objs.length > 1) reasons.push(`${objs.length} objek terpisah`);
+  if (profile === 'gradasi') warnings.push('Gambar banyak gradasi/painterly; trace solid-fill akan tampak berbeda dari aslinya. Hasilnya mungkin kurang layak untuk Adobe Stock vector.');
+  if (natural > (limits.maxColors || 16)) warnings.push(`Warna sungguhan (${natural}) melebihi batas ${limits.maxColors}; sebagian digabung.`);
+  if (bg.ratio < 0.02) warnings.push('Latar polos tidak terdeteksi; seluruh gambar dianggap satu objek.');
+
+  return {
+    profile,
+    settings: { colors, edge, smoothness, bgTol, removeBg: bg.ratio >= 0.02, shadow: true },
+    metrics: { flatFrac: +flatFrac.toFixed(3), thinFrac: +thinFrac.toFixed(3), hwThin, fitErr: +fitErr.toFixed(2), badFrac: +badFrac.toFixed(3), naturalColors: natural, objects: objs.length, bgNoise: noise, bgRatio: +bg.ratio.toFixed(3) },
+    reasons, warnings
   };
 }
 

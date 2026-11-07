@@ -1,9 +1,14 @@
-import { traceImageData } from './vectorize.js';
+import { traceImageData, analyzeImage } from './vectorize.js';
 
 self.onmessage = (e) => {
-  const { id, width, height, buffer, opts } = e.data;
+  const { id, kind, width, height, buffer, opts } = e.data;
   try {
     const data = new Uint8ClampedArray(buffer);
+    if (kind === 'analyze') {
+      const out = analyzeImage({ width, height, data }, opts);
+      self.postMessage({ id, ok: true, ...out });
+      return;
+    }
     const out = traceImageData({ width, height, data }, opts);
     self.postMessage({ id, ok: true, ...out });
   } catch (err) {
