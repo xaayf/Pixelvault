@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import DefectScanner from './DefectScanner.jsx';
+import VectorTrace from './VectorTrace.jsx';
 import {
   ShieldCheck, Sparkles, Sliders, UploadCloud, Download, Layers, ZoomIn,
   CheckCircle2, AlertTriangle, Info, RefreshCw, Trash2, Settings, Sun, Moon,
   FileImage, Cpu, HardDrive, Maximize2, ArrowRight, Eye, Check, X, Terminal,
   Gauge, Lock, Unlock, Award, Zap, Image as ImageIcon, HelpCircle, Columns,
-  Crop, Activity, FileCheck, FolderDown, Tag, Wand2, Shield, FileWarning, FlaskConical
+  Crop, Activity, FileCheck, FolderDown, Tag, Wand2, Shield, FileWarning, FlaskConical, Shapes
 } from 'lucide-react';
 
 const PRESETS = [
@@ -585,7 +586,7 @@ function PixelVaultApplication() {
     } catch { return 25.0; }
   });
 
-  const [activeTab, setActiveTab] = useState('studio'); // 'studio' | 'inspect' | 'batch'
+  const [activeTab, setActiveTab] = useState('studio'); // 'studio' | 'inspect' | 'batch' | 'vector'
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
@@ -1307,6 +1308,7 @@ function PixelVaultApplication() {
             {[
               { id: 'studio', label: 'Studio Kompresi', icon: Sliders },
               { id: 'inspect', label: 'Inspeksi Piksel & DPI', icon: ZoomIn },
+              { id: 'vector', label: 'Auto-Trace SVG', icon: Shapes },
               { id: 'batch', label: `Batch Queue (${batchQueue.length})`, icon: Layers }
             ].map((tab) => {
               const Icon = tab.icon;
@@ -2343,6 +2345,14 @@ function PixelVaultApplication() {
           </div>
         )}
 
+        {activeTab === 'vector' && (
+          <VectorTrace
+            imageUrl={sourceItem?.previewUrl}
+            baseName={sourceItem ? String(sourceItem.name || '').replace(/\.[^/.]+$/, '') : ''}
+            isDark={isDark}
+          />
+        )}
+
         {}
         {/* TAB 3: BATCH QUEUE */}
         {activeTab === 'batch' && (
@@ -2510,6 +2520,7 @@ function PixelVaultApplication() {
         {[
           { id: 'studio', label: 'Studio', icon: Sliders },
           { id: 'inspect', label: 'Inspeksi DPI', icon: ZoomIn },
+          { id: 'vector', label: 'Trace', icon: Shapes },
           { id: 'batch', label: `Batch (${batchQueue.length})`, icon: Layers }
         ].map((tab) => {
           const Icon = tab.icon;
