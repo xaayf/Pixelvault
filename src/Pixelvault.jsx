@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import DefectScanner from './DefectScanner.jsx';
 import VectorTrace from './VectorTrace.jsx';
+import GlassSelect from './GlassSelect.jsx';
 import {
   ShieldCheck, Sparkles, Sliders, UploadCloud, Download, Layers, ZoomIn,
   CheckCircle2, AlertTriangle, Info, RefreshCw, Trash2, Settings, Sun, Moon,
@@ -1282,72 +1283,61 @@ function PixelVaultApplication() {
         </div>
       )}
 
-      {/* Clean Sticky Header (Constant h-16 / 64px anti-glitch) */}
-      <header className={`sticky top-0 z-40 h-16 px-4 lg:px-8 border-b transition-colors ${isDark ? 'bg-[#070A12]/85 border-white/10' : 'bg-white/85 border-slate-200'} backdrop-blur-xl flex items-center justify-between`}>
-        {/* Left: Precision Prism SVG Logo + Badge */}
-        <div className="flex items-center gap-3 min-w-0">
-          <img src="/logo-mark.svg" alt="PixelVault" className="h-10 w-10 shrink-0" draggable={false} />
-          <div className="truncate">
-            <div className="flex items-center gap-2.5">
-              <span className="font-bold text-base lg:text-lg tracking-tight bg-gradient-to-r from-cyan-400 via-sky-300 to-indigo-400 bg-clip-text text-transparent">
-                PixelVault Pro
-              </span>
-              <span className="hidden sm:inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-cyan-500/10 text-cyan-300 border border-cyan-500/25">
-                <Lock className="w-3 h-3" /> 300 DPI Engine
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-400 truncate hidden sm:block">
-              Smart Print-Master Image Optimizer untuk Displate & Marketplace Artwork
-            </p>
-          </div>
+      {/* Header bersih: logo + nama di kiri, navigasi kaca di tengah, aksi ikon di kanan */}
+      <header className={`sticky top-0 z-40 h-16 px-4 lg:px-8 border-b transition-colors ${isDark ? 'bg-[#070A12]/70 border-white/[0.07]' : 'bg-white/75 border-slate-200/80'} backdrop-blur-2xl backdrop-saturate-150 flex items-center justify-between gap-4`}>
+        <div className="flex items-center gap-2.5 min-w-0">
+          <img src="/logo-mark.svg" alt="PixelVault" className="h-9 w-9 shrink-0" draggable={false} />
+          <span className={`font-semibold text-[15px] tracking-tight truncate ${isDark ? 'text-white' : 'text-slate-900'}`}>
+            PixelVault <span className="text-cyan-400">Pro</span>
+          </span>
         </div>
 
-        {/* Right (Desktop Navigation + Theme + Diagnostics) */}
-        <div className="flex items-center gap-2">
-          <nav className="hidden md:flex items-center p-1 rounded-xl bg-slate-900/90 border border-white/10 mr-2">
-            {[
-              { id: 'studio', label: 'Studio Kompresi', icon: Sliders },
-              { id: 'inspect', label: 'Inspeksi Piksel & DPI', icon: ZoomIn },
-              { id: 'vector', label: 'Auto-Trace SVG', icon: Shapes },
-              { id: 'batch', label: `Batch Queue (${batchQueue.length})`, icon: Layers }
-            ].map((tab) => {
-              const Icon = tab.icon;
-              const active = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                    active
-                      ? 'bg-gradient-to-r from-cyan-500 to-indigo-500 text-white shadow-md shadow-cyan-500/20'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  <Icon className="w-3.5 h-3.5" />
-                  {tab.label}
-                </button>
-              );
-            })}
-          </nav>
+        <nav className={`hidden md:flex items-center gap-0.5 p-1 rounded-full border backdrop-blur-xl ${isDark ? 'bg-white/[0.05] border-white/10' : 'bg-white/70 border-slate-200'}`}>
+          {[
+            { id: 'studio', label: 'Studio', icon: Sliders },
+            { id: 'inspect', label: 'Inspeksi', icon: ZoomIn },
+            { id: 'vector', label: 'Auto-Trace', icon: Shapes },
+            { id: 'batch', label: `Batch${batchQueue.length ? ` (${batchQueue.length})` : ''}`, icon: Layers }
+          ].map((tab) => {
+            const Icon = tab.icon;
+            const active = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-all ${
+                  active
+                    ? (isDark ? 'bg-white/15 text-white shadow-inner shadow-white/5' : 'bg-slate-900 text-white')
+                    : (isDark ? 'text-slate-400 hover:text-white hover:bg-white/5' : 'text-slate-500 hover:text-slate-900')
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                {tab.label}
+              </button>
+            );
+          })}
+        </nav>
 
+        <div className="flex items-center gap-1.5">
           <button
             onClick={() => setTheme(isDark ? 'light' : 'dark')}
-            title="Ubah Tema Visual"
-            className={`p-2.5 rounded-xl border transition-colors ${
-              isDark ? 'bg-slate-900/80 border-white/10 text-slate-300 hover:text-cyan-400' : 'bg-white border-slate-200 text-slate-700 hover:text-indigo-600'
+            title="Ubah tema"
+            aria-label="Ubah tema"
+            className={`h-9 w-9 grid place-items-center rounded-full border backdrop-blur-xl transition-colors ${
+              isDark ? 'bg-white/[0.05] border-white/10 text-slate-300 hover:text-cyan-300' : 'bg-white/70 border-slate-200 text-slate-600 hover:text-indigo-600'
             }`}
           >
             {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
           </button>
-
           <button
             onClick={() => setShowSettingsModal(true)}
-            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold transition-colors ${
-              isDark ? 'bg-slate-900/80 border-white/10 text-slate-200 hover:border-cyan-500/40' : 'bg-white border-slate-200 text-slate-700 hover:border-indigo-400'
+            title="Pengaturan & Diagnostik"
+            aria-label="Pengaturan & Diagnostik"
+            className={`h-9 w-9 grid place-items-center rounded-full border backdrop-blur-xl transition-colors ${
+              isDark ? 'bg-white/[0.05] border-white/10 text-slate-300 hover:text-cyan-300' : 'bg-white/70 border-slate-200 text-slate-600 hover:text-indigo-600'
             }`}
           >
-            <Settings className="w-4 h-4 text-cyan-400" />
-            <span className="hidden lg:inline">Settings & Diagnostics</span>
+            <Settings className="w-4 h-4" />
           </button>
         </div>
       </header>
@@ -1915,17 +1905,15 @@ function PixelVaultApplication() {
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <select
-                        value={namingPatternId}
-                        onChange={(e) => setNamingPatternId(e.target.value)}
-                        className="px-3 py-1.5 rounded-xl bg-slate-950 border border-white/15 text-xs font-mono text-slate-200 focus:outline-none focus:border-cyan-400"
-                      >
-                        {NAMING_PATTERNS.map((pat) => (
-                          <option key={pat.id} value={pat.id}>
-                            {pat.label}
-                          </option>
-                        ))}
-                      </select>
+                      <div className="min-w-[200px]">
+                        <GlassSelect
+                          isDark={isDark}
+                          ariaLabel="Pola penamaan file"
+                          value={namingPatternId}
+                          onChange={setNamingPatternId}
+                          options={NAMING_PATTERNS.map((pat) => ({ value: pat.id, label: pat.label }))}
+                        />
+                      </div>
                       <button
                         type="button"
                         onClick={() => setSanitizeCommercialName(!sanitizeCommercialName)}

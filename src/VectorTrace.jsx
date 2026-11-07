@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import GlassSelect from './GlassSelect.jsx';
 import { Shapes, Loader2, Download, AlertTriangle, CheckCircle2, UploadCloud, Archive } from 'lucide-react';
 import { DETAIL_LEVELS, SMOOTHNESS, RATIOS, DEFAULT_LIMITS, meanAbsDiff } from './vectorize.js';
 import { makeZip } from './zip.js';
@@ -202,27 +203,19 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Detail (hanya untuk mode lama)</span>
-              <select value={detail} onChange={(e) => setDetail(e.target.value)} className={field}>
-                {Object.entries(DETAIL_LEVELS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-              </select>
+              <GlassSelect isDark={isDark} ariaLabel="Detail" value={detail} onChange={setDetail} options={Object.entries(DETAIL_LEVELS).map(([k, v]) => ({ value: k, label: v.label }))} />
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Sisi terpanjang kerja</span>
-              <select value={edge} onChange={(e) => setEdge(+e.target.value)} className={field}>
-                {EDGES.map((v) => <option key={v} value={v}>{v}px{v === 1400 ? ' (disarankan)' : ''}</option>)}
-              </select>
+              <GlassSelect isDark={isDark} ariaLabel="Sisi terpanjang kerja" value={edge} onChange={(v) => setEdge(+v)} options={EDGES.map((v) => ({ value: v, label: `${v}px${v === 1400 ? ' (disarankan)' : ''}` }))} />
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Kehalusan kurva</span>
-              <select value={smoothness} onChange={(e) => setSmoothness(e.target.value)} className={field}>
-                {Object.entries(SMOOTHNESS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-              </select>
+              <GlassSelect isDark={isDark} ariaLabel="Kehalusan kurva" value={smoothness} onChange={setSmoothness} options={Object.entries(SMOOTHNESS).map(([k, v]) => ({ value: k, label: v.label }))} />
             </label>
             <label className="text-[11px] space-y-1">
               <span className={sub}>Rasio kanvas SVG</span>
-              <select value={ratio} onChange={(e) => setRatio(e.target.value)} className={field}>
-                {Object.entries(RATIOS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-              </select>
+              <GlassSelect isDark={isDark} ariaLabel="Rasio kanvas SVG" value={ratio} onChange={setRatio} options={Object.entries(RATIOS).map(([k, v]) => ({ value: k, label: v.label }))} />
             </label>
             <label className="text-[11px] flex items-center gap-2 min-h-[40px]">
               <input type="checkbox" checked={removeBg} onChange={(e) => setRemoveBg(e.target.checked)} className="w-5 h-5" />
