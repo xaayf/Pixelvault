@@ -292,18 +292,31 @@ function quantize(data, labels, flat, w, h, pal, passes) {
         }
       }
       if (!any) { nxt0[p] = nearest(p); continue; }
-      // pilih warna palet terdekat (menurut warna piksel sendiri) di antara warna datar yang ada di sekitarnya;
-      // mencegah munculnya warna "campuran" ketiga di sepanjang garis tipis
+      // Piksel peralihan = campuran dua warna datar di sekitarnya. Proyeksikan ke ruas antar-pasangan warna: pasangan dengan
+      // sisa jarak terkecil menang, lalu t<0.5 -> warna pertama. Memakai "warna terdekat" biasa membuat garis tipis
+      // melebar (setiap piksel campuran jatuh ke warna garis), proyeksi menjaga lebar garis sama dengan aslinya.
       const i = p * 4;
       rgb2lab(data[i], data[i + 1], data[i + 2], lab);
-      let best = 0, bd = Infinity;
-      for (let c = 0; c < K; c++) {
-        if (cnt[c] < 2) continue;
-        const q = pal[c].lab;
-        const dd = (lab[0] - q[0]) ** 2 + (lab[1] - q[1]) ** 2 + (lab[2] - q[2]) ** 2;
-        if (dd < bd) { bd = dd; best = c; }
+      const cand = [];
+      for (let c = 0; c < K; c++) if (cnt[c] >= 2) cand.push(c);
+      let best = -1, bd = Infinity;
+      for (let u = 0; u < cand.length; u++) {
+        const qa = pal[cand[u]].lab;
+        const d0 = (lab[0] - qa[0]) ** 2 + (lab[1] - qa[1]) ** 2 + (lab[2] - qa[2]) ** 2;
+        if (d0 < bd) { bd = d0; best = cand[u]; }
+        for (let v = u + 1; v < cand.length; v++) {
+          const qb = pal[cand[v]].lab;
+          const ex = qb[0] - qa[0], ey = qb[1] - qa[1], ez = qb[2] - qa[2];
+          const len2 = ex * ex + ey * ey + ez * ez;
+          if (len2 < 1) continue;
+          let t = ((lab[0] - qa[0]) * ex + (lab[1] - qa[1]) * ey + (lab[2] - qa[2]) * ez) / len2;
+          if (t < 0 || t > 1) continue;
+          const rx = lab[0] - qa[0] - t * ex, ry = lab[1] - qa[1] - t * ey, rz = lab[2] - qa[2] - t * ez;
+          const res = rx * rx + ry * ry + rz * rz;
+          if (res + 1e-6 < bd * 0.6) { bd = res / 0.6; best = t < 0.5 ? cand[u] : cand[v]; }
+        }
       }
-      nxt0[p] = bd === Infinity ? nearest(p) : best;
+      nxt0[p] = best < 0 ? nearest(p) : best;
     }
   }
   let cur = nxt0;
@@ -399,6 +412,47 @@ function boxBlur(src, dst, W, H, r) {
       acc += dst[Math.min(H - 1, y + r + 1) * W + x] - dst[Math.max(0, y - r) * W + x];
     }
   }
+}
+
+// Cincin terluar objek (<= 3 px dari latar) sering berisi piksel campuran tepi yang jatuh ke warna lain (mis. hijau tua di
+// luar rim emas), yang di tumpukan lapisan tampak sebagai garis tipis di luar rim. Tiap piksel cincin diganti dengan warna
+// terbanyak di antara piksel cincin di sekitarnya (jendela 9x9), sehingga cincin selalu satu warna sepanjang tepi.
+function smoothOuterRing(lab, cw, ch, K) {
+  const ring = new Uint8Array(cw * ch);
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      if (lab[y * cw + x] < 0) continue;
+      let edge = false;
+      for (let dy = -3; dy <= 3 && !edge; dy++) {
+        for (let dx = -3; dx <= 3; dx++) {
+          const yy = y + dy, xx = x + dx;
+          if (yy < 0 || yy >= ch || xx < 0 || xx >= cw || lab[yy * cw + xx] < 0) { edge = true; break; }
+        }
+      }
+      if (edge) ring[y * cw + x] = 1;
+    }
+  }
+  const out = new Int16Array(lab);
+  const cnt = new Int32Array(K);
+  for (let y = 0; y < ch; y++) {
+    for (let x = 0; x < cw; x++) {
+      if (!ring[y * cw + x]) continue;
+      cnt.fill(0);
+      for (let dy = -4; dy <= 4; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= ch) continue;
+        for (let dx = -4; dx <= 4; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= cw || !ring[yy * cw + xx]) continue;
+          cnt[lab[yy * cw + xx]]++;
+        }
+      }
+      let best = lab[y * cw + x], bc = cnt[best];
+      for (let c = 0; c < K; c++) if (cnt[c] > bc) { bc = cnt[c]; best = c; }
+      out[y * cw + x] = best;
+    }
+  }
+  lab.set(out);
 }
 
 // Komponen terhubung kecil (bintik) digabung ke label tetangga yang paling banyak menyentuhnya.
@@ -566,6 +620,7 @@ export function traceImageData(imgd, opts = {}) {
       // naik resolusi: target sisi panjang ~1800 px, 2-3x, total <= 4 juta piksel
       let f = Math.max(2, Math.min(3, Math.round(1800 / Math.max(cw, ch))));
       while (f > 2 && cw * f * ch * f > 4e6) f--;
+      smoothOuterRing(lab, cw, ch, pal.length);
       despeckle(lab, cw, ch, pal.length, 8);
       paths = traceStacked(lab, cw, ch, pal, f, curveTol, curveBlur);
     } else {
