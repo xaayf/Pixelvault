@@ -3,6 +3,7 @@
 // -> trace per objek -> susun SVG per objek dan SVG gabungan dalam kanvas rasio tertentu.
 // Murni JS tanpa DOM supaya bisa jalan di Web Worker dan diuji di Node.
 import ImageTracer from 'imagetracerjs';
+import { marchContours, fitLoop, curvesToPath, polyArea } from './curves.js';
 
 export const DETAIL_LEVELS = {
   rendah: { label: 'Rendah (paling ringan)', ltres: 2, qtres: 2, pathomit: 30 },
@@ -17,6 +18,14 @@ export const RATIOS = {
 };
 
 // Batas peringatan. Adobe tidak mempublikasikan angka pasti; ini asumsi awal dan bisa diubah dari UI.
+// Kehalusan kurva: toleransi pencocokan Bezier (px sumber) dan sigma blur kontur (px sumber).
+export const SMOOTHNESS = {
+  detail: { label: 'Detail (ikuti tepi asli)', tol: 0.8, blur: 0.8 },
+  seimbang: { label: 'Seimbang (disarankan)', tol: 1.4, blur: 1.2 },
+  halus: { label: 'Sangat halus (node paling sedikit)', tol: 2, blur: 1.6 },
+  tangga: { label: 'Mode lama (garis tangga piksel)', tol: 0, blur: 0 }
+};
+
 export const DEFAULT_LIMITS = { maxNodes: 20000, maxColors: 16 };
 
 // ---------- warna ----------
@@ -365,6 +374,104 @@ function wrapSvg(inner, W, H, artboardLong) {
 }
 
 
+// ---------- penghalusan kontur ----------
+// Penyebab tepi bergerigi: label warna per piksel membentuk "tangga" 1 px yang ikut dibaca pelacak jadi ratusan segmen
+// pendek. Solusi: naikkan resolusi label (nearest), buramkan indikator tiap warna (box blur 3 lintasan ~ Gaussian), lalu
+// ambil argmax. Batas antar-warna jadi kontur halus dengan posisi sub-piksel, dan bisa dipasang kurva yang bersih.
+function boxBlur(src, dst, W, H, r) {
+  const n = 2 * r + 1;
+  // horizontal: src -> dst
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    let acc = src[row] * (r + 1);
+    for (let k = 1; k <= r; k++) acc += src[row + Math.min(W - 1, k)];
+    for (let x = 0; x < W; x++) {
+      dst[row + x] = acc / n;
+      acc += src[row + Math.min(W - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+    }
+  }
+  // vertikal: dst -> src
+  for (let x = 0; x < W; x++) {
+    let acc = dst[x] * (r + 1);
+    for (let k = 1; k <= r; k++) acc += dst[Math.min(H - 1, k) * W + x];
+    for (let y = 0; y < H; y++) {
+      src[y * W + x] = acc / n;
+      acc += dst[Math.min(H - 1, y + r + 1) * W + x] - dst[Math.max(0, y - r) * W + x];
+    }
+  }
+}
+
+// Komponen terhubung kecil (bintik) digabung ke label tetangga yang paling banyak menyentuhnya.
+function despeckle(lab, cw, ch, K, minArea) {
+  const seen = new Uint8Array(cw * ch);
+  const stack = new Int32Array(cw * ch);
+  const cnt = new Int32Array(K + 1);
+  for (let s = 0; s < lab.length; s++) {
+    if (seen[s]) continue;
+    const L = lab[s];
+    let sp = 0, n = 0;
+    const members = [];
+    stack[sp++] = s; seen[s] = 1;
+    while (sp > 0) {
+      const p = stack[--sp];
+      n++;
+      if (n <= minArea) members.push(p);
+      const x = p % cw, y = (p / cw) | 0;
+      if (x > 0 && !seen[p - 1] && lab[p - 1] === L) { seen[p - 1] = 1; stack[sp++] = p - 1; }
+      if (x < cw - 1 && !seen[p + 1] && lab[p + 1] === L) { seen[p + 1] = 1; stack[sp++] = p + 1; }
+      if (y > 0 && !seen[p - cw] && lab[p - cw] === L) { seen[p - cw] = 1; stack[sp++] = p - cw; }
+      if (y < ch - 1 && !seen[p + cw] && lab[p + cw] === L) { seen[p + cw] = 1; stack[sp++] = p + cw; }
+    }
+    if (n >= minArea || L < 0) continue;
+    cnt.fill(0);
+    for (const p of members) {
+      const x = p % cw, y = (p / cw) | 0;
+      const nb = [x > 0 ? lab[p - 1] : -1, x < cw - 1 ? lab[p + 1] : -1, y > 0 ? lab[p - cw] : -1, y < ch - 1 ? lab[p + cw] : -1];
+      for (const v of nb) if (v !== L) cnt[v < 0 ? K : v]++;
+    }
+    let best = -2, bc = 0;
+    for (let c = 0; c <= K; c++) if (cnt[c] > bc) { bc = cnt[c]; best = c === K ? -1 : c; }
+    if (best !== -2) for (const p of members) lab[p] = best;
+  }
+}
+
+// Mesin kurva: lapisan bertumpuk. Warna diurutkan dari luas terbesar; lapisan ke-r berisi semua piksel berperingkat >= r,
+// jadi lapisan bawah selalu menjulur di bawah lapisan atas (tanpa celah/seam). Tiap mask diburamkan lalu dikonturkan
+// pada level 0.5 (sub-piksel) dan dicocokkan ke Bezier kubik.
+function traceStacked(lab, cw, ch, pal, f, tol, blurPx) {
+  const K = pal.length;
+  const area = new Int32Array(K);
+  for (let i = 0; i < lab.length; i++) if (lab[i] >= 0) area[lab[i]]++;
+  const order = [...Array(K).keys()].filter((c) => area[c] > 0).sort((a, b) => area[b] - area[a]);
+  const rank = new Int16Array(K).fill(-1);
+  order.forEach((c, r) => { rank[c] = r; });
+  const W = cw * f, H = ch * f;
+  const up = new Int16Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const sy = ((y / f) | 0) * cw;
+    for (let x = 0; x < W; x++) up[y * W + x] = lab[sy + ((x / f) | 0)];
+  }
+  const sg = blurPx * f; // sigma dalam piksel beresolusi tinggi; 3 box blur radius r punya sigma^2 = r(r+1)
+  const r = Math.max(1, Math.round((-1 + Math.sqrt(1 + 4 * sg * sg)) / 2));
+  const a = new Float32Array(W * H), b = new Float32Array(W * H);
+  const map = (p) => [(p[0] + 0.5) / f, (p[1] + 0.5) / f];
+  const out = [];
+  order.forEach((c, ri) => {
+    for (let i = 0; i < a.length; i++) { const v = up[i]; a[i] = v >= 0 && rank[v] >= ri ? 1 : 0; }
+    boxBlur(a, b, W, H, r); boxBlur(a, b, W, H, r); boxBlur(a, b, W, H, r);
+    const loops = marchContours(a, W, H, 0.5);
+    let d = '';
+    for (const lp of loops) {
+      if (Math.abs(polyArea(lp)) / (f * f) < 3) continue; // bintik < 3 px^2
+      const curves = fitLoop(lp, tol * f, { k: 3 + f });
+      const sd = curvesToPath(curves, map);
+      if (sd) d += (d ? ' ' : '') + sd;
+    }
+    if (d) out.push(`<path fill="rgb(${pal[c].r},${pal[c].g},${pal[c].b})" fill-rule="evenodd" d="${d}" />`);
+  });
+  return out;
+}
+
 // Tepi stiker: cincin terluar objek (selebar r piksel dari latar) yang terang. Warnanya = median cincin itu, diambil ke
 // warna palet terdekat. Mengembalikan juga penanda piksel cincin terang supaya bisa dipaksa ke warna tepi (cincin tipis
 // 2-4 px tidak punya piksel "datar", jadi kalau tidak dipaksa ia tertelan warna garis di sebelahnya).
@@ -413,10 +520,12 @@ function borderInfo(data, labels, w, h, o, x0, y0, cw, ch, pal) {
 export function traceImageData(imgd, opts = {}) {
   const {
     colors = 14, detail = 'sedang', removeBg = true, bgTol = 8, shadow = true, ratio = 'asli', marginRel = 0.06,
-    smooth = 2, rightAngle = false, artboardLong = 3000, limits = DEFAULT_LIMITS
+    smooth = 2, rightAngle = false, smoothness = 'seimbang', artboardLong = 3000, limits = DEFAULT_LIMITS
   } = opts;
   const { width: w, height: h, data } = imgd;
   const lvl = DETAIL_LEVELS[detail] || DETAIL_LEVELS.sedang;
+  const sm = SMOOTHNESS[smoothness] || SMOOTHNESS.seimbang;
+  const curveSmooth = sm.tol > 0, curveTol = sm.tol, curveBlur = sm.blur;
   const ratioVal = (RATIOS[ratio] || RATIOS.asli).value;
 
   let bg = { mask: new Uint8Array(w * h), ratio: 0, info: null };
@@ -444,37 +553,45 @@ export function traceImageData(imgd, opts = {}) {
     const x1 = Math.min(w, o.x + o.w + margin), y1 = Math.min(h, o.y + o.h + margin);
     const cw = x1 - x0, ch = y1 - y0;
     const bi = borderInfo(data, labels, w, h, o, x0, y0, cw, ch, pal);
-    const cd = new Uint8ClampedArray(cw * ch * 4);
+    // label per piksel pada resolusi kerja (-1 = latar / bukan objek ini)
+    const lab = new Int16Array(cw * ch).fill(-1);
     for (let y = 0; y < ch; y++) {
       for (let x = 0; x < cw; x++) {
         const p = (y + y0) * w + (x + x0);
-        if (labels[p] === o.index && idx[p] >= 0) {
-          const c = bi.forced && bi.ring[y * cw + x] ? bi.color : pal[idx[p]];
-          const q = (y * cw + x) * 4;
-          cd[q] = c.r; cd[q + 1] = c.g; cd[q + 2] = c.b; cd[q + 3] = 255;
-        }
+        if (labels[p] === o.index && idx[p] >= 0) lab[y * cw + x] = bi.forced && bi.ring[y * cw + x] ? bi.index : idx[p];
       }
     }
-    const topts = {
-      ltres: lvl.ltres, qtres: lvl.qtres, pathomit: lvl.pathomit, rightangleenhance: rightAngle,
-      colorsampling: 0, numberofcolors: 2, mincolorratio: 0, colorquantcycles: 1,
-      layering: 0, strokewidth: 0, linefilter: false, scale: 1, roundcoords: 2, viewbox: true, desc: false, lcpr: 0, qcpr: 0,
-      blurradius: 0, blurdelta: 20
-    };
-    const clean = (raw) => (raw.match(PATH_RE) || [])
-      .filter((p) => !/\bopacity="0"/.test(p) && !/fill-opacity="0"/.test(p))
-      .map((p) => p.replace(/\s(?:stroke="[^"]*"|stroke-width="[^"]*"|opacity="1")/g, ''));
-    // alas: siluet objek berwarna tepi stiker (krem). Jadi bentuk tersendiri, sekaligus menutup celah tipis antar-path.
-    const bc = bi.color;
-    const sd = new Uint8ClampedArray(cw * ch * 4);
-    for (let y = 0; y < ch; y++) {
-      for (let x = 0; x < cw; x++) {
-        if (labels[(y + y0) * w + (x + x0)] === o.index) { const q = (y * cw + x) * 4; sd[q] = bc.r; sd[q + 1] = bc.g; sd[q + 2] = bc.b; sd[q + 3] = 255; }
+    let paths;
+    if (curveSmooth) {
+      // naik resolusi: target sisi panjang ~1800 px, 2-3x, total <= 4 juta piksel
+      let f = Math.max(2, Math.min(3, Math.round(1800 / Math.max(cw, ch))));
+      while (f > 2 && cw * f * ch * f > 4e6) f--;
+      despeckle(lab, cw, ch, pal.length, 8);
+      paths = traceStacked(lab, cw, ch, pal, f, curveTol, curveBlur);
+    } else {
+      const cd = new Uint8ClampedArray(cw * ch * 4);
+      const sd = new Uint8ClampedArray(cw * ch * 4);
+      const bc = bi.color;
+      for (let p = 0; p < lab.length; p++) {
+        if (lab[p] < 0) continue;
+        const c = pal[lab[p]];
+        const q = p * 4;
+        cd[q] = c.r; cd[q + 1] = c.g; cd[q + 2] = c.b; cd[q + 3] = 255;
+        sd[q] = bc.r; sd[q + 1] = bc.g; sd[q + 2] = bc.b; sd[q + 3] = 255;
       }
+      const topts = {
+        ltres: lvl.ltres, qtres: lvl.qtres, pathomit: lvl.pathomit, rightangleenhance: rightAngle,
+        colorsampling: 0, numberofcolors: 2, mincolorratio: 0, colorquantcycles: 1,
+        layering: 0, strokewidth: 0, linefilter: false, scale: 1, roundcoords: 2, viewbox: true, desc: false, lcpr: 0, qcpr: 0,
+        blurradius: 0, blurdelta: 20
+      };
+      const clean = (raw) => (raw.match(PATH_RE) || [])
+        .filter((p) => !/\bopacity="0"/.test(p) && !/fill-opacity="0"/.test(p))
+        .map((p) => p.replace(/\s(?:stroke="[^"]*"|stroke-width="[^"]*"|opacity="1")/g, ''));
+      const base = clean(ImageTracer.imagedataToSVG({ width: cw, height: ch, data: sd }, { ...topts, pal: [{ r: bc.r, g: bc.g, b: bc.b, a: 255 }, { r: 0, g: 0, b: 0, a: 0 }], pathomit: Math.max(lvl.pathomit, 30) }));
+      const art = clean(ImageTracer.imagedataToSVG({ width: cw, height: ch, data: cd }, { ...topts, pal: tracerPal, numberofcolors: tracerPal.length }));
+      paths = [...base, ...art];
     }
-    const base = clean(ImageTracer.imagedataToSVG({ width: cw, height: ch, data: sd }, { ...topts, pal: [{ r: bc.r, g: bc.g, b: bc.b, a: 255 }, { r: 0, g: 0, b: 0, a: 0 }], pathomit: Math.max(lvl.pathomit, 30) }));
-    const art = clean(ImageTracer.imagedataToSVG({ width: cw, height: ch, data: cd }, { ...topts, pal: tracerPal, numberofcolors: tracerPal.length }));
-    const paths = [...base, ...art];
     return { o, x0, y0, cw, ch, paths: paths.join('\n') };
   });
 

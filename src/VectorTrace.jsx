@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Shapes, Loader2, Download, AlertTriangle, CheckCircle2, UploadCloud, Archive } from 'lucide-react';
-import { DETAIL_LEVELS, RATIOS, DEFAULT_LIMITS, meanAbsDiff } from './vectorize.js';
+import { DETAIL_LEVELS, SMOOTHNESS, RATIOS, DEFAULT_LIMITS, meanAbsDiff } from './vectorize.js';
 import { makeZip } from './zip.js';
 
 const EDGES = [1000, 1400, 2000];
@@ -39,6 +39,7 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
   const [bgTol, setBgTol] = useState(8);
   const [shadow, setShadow] = useState(true);
   const [ratio, setRatio] = useState('asli');
+  const [smoothness, setSmoothness] = useState('seimbang');
   const [edge, setEdge] = useState(1400);
   const [maxNodes, setMaxNodes] = useState(DEFAULT_LIMITS.maxNodes);
   const [maxColors, setMaxColors] = useState(DEFAULT_LIMITS.maxColors);
@@ -90,7 +91,7 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
         worker.onmessage = (ev) => (ev.data.ok ? res(ev.data) : rej(new Error(ev.data.error)));
         worker.onerror = (ev) => rej(new Error(ev.message || 'Worker gagal'));
         const copy = src.data.buffer.slice(0);
-        worker.postMessage({ id, width: w, height: h, buffer: copy, opts: { colors, detail, removeBg, bgTol, shadow, ratio, limits: { maxNodes, maxColors } } }, [copy]);
+        worker.postMessage({ id, width: w, height: h, buffer: copy, opts: { colors, detail, removeBg, bgTol, shadow, ratio, smoothness, limits: { maxNodes, maxColors } } }, [copy]);
       });
       worker.terminate();
       workerRef.current = null;
@@ -200,7 +201,7 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
               <input type="range" min={4} max={24} value={colors} onChange={(e) => setColors(+e.target.value)} className="w-full" />
             </label>
             <label className="text-[11px] space-y-1">
-              <span className={sub}>Detail</span>
+              <span className={sub}>Detail (hanya untuk mode lama)</span>
               <select value={detail} onChange={(e) => setDetail(e.target.value)} className={field}>
                 {Object.entries(DETAIL_LEVELS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
               </select>
@@ -209,6 +210,12 @@ export default function VectorTrace({ imageUrl, baseName, isDark }) {
               <span className={sub}>Sisi terpanjang kerja</span>
               <select value={edge} onChange={(e) => setEdge(+e.target.value)} className={field}>
                 {EDGES.map((v) => <option key={v} value={v}>{v}px{v === 1400 ? ' (disarankan)' : ''}</option>)}
+              </select>
+            </label>
+            <label className="text-[11px] space-y-1">
+              <span className={sub}>Kehalusan kurva</span>
+              <select value={smoothness} onChange={(e) => setSmoothness(e.target.value)} className={field}>
+                {Object.entries(SMOOTHNESS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
               </select>
             </label>
             <label className="text-[11px] space-y-1">
